@@ -48,37 +48,62 @@ export async function readErc20TotalSupply(rpcUrl: string, tokenAddress: string)
   return Number(raw / 10n ** 14n) / 10_000;
 }
 
+interface GeckoTerminalMultiResponse {
+  data?: Array<{
+    attributes?: {
+      address?: string;
+      price_usd?: string;
+    };
+  }>;
+}
+
 interface DexScreenerResponse {
   pairs?: Array<{
     chainId?: string;
     priceUsd?: string;
     baseToken?: { address?: string };
-    liquidity?: { usd?: number };
   }>;
 }
 
 /**
- * Reads live on-chain Base SSI token supply via eth_call + DexScreener Base liquidity price
+ * Reads live on-chain Base SSI token supply via eth_call + Base DEX pool pricing
  * and reconciles against SoDEX Spot CLOB orderbook prices to detect cross-venue parity spreads.
  */
 export async function computeSsiParity(
   sodexPriceMap: Record<string, { lastPx: number; spreadBps: number }>
 ): Promise<SsiParityRow[]> {
-  const addresses = BASE_SSI_TOKENS.map((t) => t.address).join(",");
-  const [supplies, dexData] = await Promise.all([
+  const addresses = BASE_SSI_TOKENS.map((t) => t.address.toLowerCase()).join(",");
+  const [supplies, geckoData] = await Promise.all([
     Promise.all(BASE_SSI_TOKENS.map((t) => readErc20TotalSupply(BASE_MAINNET_RPC, t.address).catch(() => 0))),
-    fetchJson<DexScreenerResponse>(`https://api.dexscreener.com/latest/dex/tokens/${addresses}`, {}, 8000).catch(
-      () => ({ pairs: [] })
-    )
+    fetchJson<GeckoTerminalMultiResponse>(
+      `https://api.geckoterminal.com/api/v2/networks/base/tokens/multi/${addresses}`,
+      {},
+      8000
+    ).catch(() => ({ data: [] }))
   ]);
 
   const dexPriceByAddr = new Map<string, number>();
-  for (const pair of dexData.pairs ?? []) {
-    if (pair.chainId !== "base") continue;
-    const addr = pair.baseToken?.address?.toLowerCase();
-    const px = pair.priceUsd ? Number.parseFloat(pair.priceUsd) : NaN;
-    if (addr && Number.isFinite(px) && !dexPriceByAddr.has(addr)) {
+  for (const row of geckoData.data ?? []) {
+    const addr = row.attributes?.address?.toLowerCase();
+    const px = row.attributes?.price_usd ? Number.parseFloat(row.attributes.price_usd) : NaN;
+    if (addr && Number.isFinite(px) && px > 0) {
       dexPriceByAddr.set(addr, px);
+    }
+  }
+
+  if (dexPriceByAddr.size === 0) {
+    const dexData = await fetchJson<DexScreenerResponse>(
+      `https://api.dexscreener.com/latest/dex/tokens/${BASE_SSI_TOKENS[0].address}`,
+      {},
+      6000
+    ).catch(() => ({ pairs: [] }));
+    for (const pair of dexData.pairs ?? []) {
+      if (pair.chainId !== "base") continue;
+      const addr = pair.baseToken?.address?.toLowerCase();
+      const px = pair.priceUsd ? Number.parseFloat(pair.priceUsd) : NaN;
+      if (addr && Number.isFinite(px) && !dexPriceByAddr.has(addr)) {
+        dexPriceByAddr.set(addr, px);
+      }
     }
   }
 

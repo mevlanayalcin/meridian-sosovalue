@@ -9,7 +9,7 @@ interface NimCompletionResponse {
 }
 
 const DEFAULT_NIM_URL = "https://integrate.api.nvidia.com/v1";
-const DEFAULT_MODEL = "mistralai/mistral-large-4-1t-a52b";
+const DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b";
 
 /**
  * Generates an evidence-grounded institutional investment thesis and allocation proposal.
@@ -133,7 +133,7 @@ export async function generateGroundedThesis(
           body: JSON.stringify({
             model: DEFAULT_MODEL,
             temperature: 0.2,
-            max_tokens: 700,
+            max_tokens: 1400,
             messages: [
               {
                 role: "system",
