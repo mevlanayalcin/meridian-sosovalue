@@ -134,6 +134,7 @@ export async function generateGroundedThesis(
             model: DEFAULT_MODEL,
             temperature: 0.2,
             max_tokens: 1400,
+            chat_template_kwargs: { enable_thinking: false },
             messages: [
               {
                 role: "system",
