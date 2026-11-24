@@ -12,8 +12,8 @@ export interface PublicNewsItem {
   provenance: ProvenanceSource;
 }
 
-const BULL_WORDS = /\b(surge|rally|inflow|approve|adoption|record|launch|partner|growth|breakout|gain)\b/i;
-const BEAR_WORDS = /\b(hack|exploit|outflow|drop|crash|lawsuit|ban|decline|liquidation|sec|warning|selloff)\b/i;
+const BULL_WORDS = /\b(surge|rally|inflow|approve|adoption|record|launch|partner|growth|breakout|gain|soar|etf)\b/i;
+const BEAR_WORDS = /\b(hack|exploit|outflow|drop|crash|lawsuit|ban|decline|liquidation|sec|warning|selloff|slump)\b/i;
 
 export function classifyHeadlineSentiment(title: string): "BULLISH" | "BEARISH" | "NEUTRAL" {
   const bull = BULL_WORDS.test(title);
@@ -41,6 +41,32 @@ interface TavilySearchResponse {
     content?: string;
     published_date?: string;
   }>;
+}
+
+function parseRssItems(xml: string, sourceLabel: string): PublicNewsItem[] {
+  const items: PublicNewsItem[] = [];
+  const itemMatches = xml.matchAll(/<item>([\s\S]*?)<\/item>/g);
+  for (const m of itemMatches) {
+    const block = m[1];
+    const titleRaw = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() ?? "";
+    const linkRaw = block.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() ?? "";
+    const pubRaw = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1]?.trim() ?? "";
+    const title = titleRaw.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+    if (title && linkRaw) {
+      items.push({
+        id: `rss-${items.length}-${pubRaw.slice(0, 16)}`,
+        title,
+        source: sourceLabel,
+        url: linkRaw,
+        publishedAt: pubRaw ? new Date(pubRaw).toISOString() : new Date().toISOString(),
+        sentiment: classifyHeadlineSentiment(title),
+        tags: ["Crypto", "Market"],
+        provenance: "Public Market Feed"
+      });
+    }
+    if (items.length >= 10) break;
+  }
+  return items;
 }
 
 export async function fetchPublicNews(tavilyApiKey?: string): Promise<PublicNewsItem[]> {
@@ -73,7 +99,23 @@ export async function fetchPublicNews(tavilyApiKey?: string): Promise<PublicNews
         }));
       }
     } catch {
-      // Fall through to CryptoCompare live feed
+      // Fall through to public RSS / CryptoCompare feeds
+    }
+  }
+
+  for (const [rssUrl, sourceLabel] of [
+    ["https://cointelegraph.com/rss", "Cointelegraph"],
+    ["https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk"]
+  ] as const) {
+    try {
+      const res = await fetch(rssUrl, { headers: { "User-Agent": "Meridian-Finance-Desk/1.0" } });
+      if (res.ok) {
+        const xml = await res.text();
+        const parsed = parseRssItems(xml, sourceLabel);
+        if (parsed.length > 0) return parsed;
+      }
+    } catch {
+      // Try next feed
     }
   }
 
@@ -83,7 +125,7 @@ export async function fetchPublicNews(tavilyApiKey?: string): Promise<PublicNews
       {},
       7000
     );
-    return (res.Data ?? []).slice(0, 12).map((item) => ({
+    return (res.Data ?? []).slice(0, 10).map((item) => ({
       id: String(item.id),
       title: item.title,
       source: item.source,

@@ -68,7 +68,7 @@ export async function computeSsiParity(
   ]);
 
   const dexPriceByAddr = new Map<string, number>();
-  for (const [k, v] of Object.entries(llamaData.coins ?? {})) {
+  for (const [k, v] of Object.entries(llamaData.coins ?? {}) as Array<[string, { price?: number }]>) {
     const addr = k.replace(/^base:/i, "").toLowerCase();
     if (v?.price && Number.isFinite(v.price) && v.price > 0) {
       dexPriceByAddr.set(addr, v.price);
