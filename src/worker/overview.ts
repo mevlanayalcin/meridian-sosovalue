@@ -64,7 +64,8 @@ export async function buildMarketOverview(opts: {
       if (sosoOpenApi.connected) provenanceSet.add("SoSoValue OpenAPI v1/v3");
 
       if (overview) {
-        sosoOpenApi.totalMarketCapUsd = overview.total_market_cap ?? null;
+        const capNum = Number(overview.total_market_cap);
+        sosoOpenApi.totalMarketCapUsd = Number.isFinite(capNum) && capNum > 0 ? capNum : null;
       }
       if (etfHist.length) {
         const latestSettled = etfHist.find((r) => r.total_net_inflow !== null) ?? etfHist[0];
@@ -81,16 +82,26 @@ export async function buildMarketOverview(opts: {
       }
 
       if (sosoNews.list?.length) {
-        newsFeed = sosoNews.list.map((n) => ({
-          id: `soso-${n.id}`,
-          title: n.title || n.content?.slice(0, 120) || "SoSoValue Market Flash",
-          source: "SoSoValue News",
-          url: n.source_link || "https://sosovalue.com",
-          publishedAt: n.release_time ? new Date(n.release_time).toISOString() : new Date().toISOString(),
-          sentiment: classifyHeadlineSentiment((n.title ?? "") + " " + (n.content ?? "")),
-          tags: n.tags ?? ["SoSoValue"],
-          provenance: "SoSoValue OpenAPI v1/v3"
-        }));
+        newsFeed = sosoNews.list.map((n) => {
+          let publishedIso = new Date().toISOString();
+          if (n.release_time !== undefined && n.release_time !== null) {
+            const rawNum = Number(n.release_time);
+            const dt = Number.isFinite(rawNum)
+              ? new Date(rawNum < 1e12 ? rawNum * 1000 : rawNum)
+              : new Date(String(n.release_time));
+            if (Number.isFinite(dt.getTime())) publishedIso = dt.toISOString();
+          }
+          return {
+            id: `soso-${n.id}`,
+            title: n.title || n.content?.slice(0, 120) || "SoSoValue Market Flash",
+            source: "SoSoValue News",
+            url: n.source_link || "https://sosovalue.com",
+            publishedAt: publishedIso,
+            sentiment: classifyHeadlineSentiment((n.title ?? "") + " " + (n.content ?? "")),
+            tags: n.tags ?? ["SoSoValue"],
+            provenance: "SoSoValue OpenAPI v1/v3"
+          };
+        });
       }
     } catch (err) {
       sosoOpenApi.errorNote = err instanceof Error ? err.message : "SoSoValue OpenAPI request failed";
