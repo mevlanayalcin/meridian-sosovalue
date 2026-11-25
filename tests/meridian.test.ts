@@ -1,18 +1,24 @@
-import { describe, expect, it } from "vitest";
-import { verifyTypedData, keccak256, toHex } from "viem";
+import { describe, expect, it, vi } from "vitest";
+import { verifyTypedData, keccak256, toHex, hashTypedData } from "viem";
 import {
   buildExchangeActionTypedData,
+  buildMetaMaskTypedDataV4,
   buildPerpsOrderPayload,
   buildSpotOrderPayload,
+  normalizeSoDexSignature,
+  roundToStep,
   signExchangeActionWithKey
 } from "../src/engine/sodex-eip712";
 import { evaluateTradeFirewall, simulateBookFill } from "../src/engine/firewall";
 import { detectMarketRegime, runBasketBacktest } from "../src/engine/quant";
+import { sanitizeVaultApy } from "../src/engine/ai-analyst";
+import { scaleTokenSupply } from "../src/providers/onchain";
+import { SoSoValueClient } from "../src/providers/sosovalue";
 import { handleMcpRequest } from "../src/worker/mcp";
-import app from "../src/worker/index";
+import { app } from "../src/worker/index";
 import type { OrderbookSnapshot } from "../src/shared/types";
 
-describe("SoDEX EIP-712 Protocol Serialization & Signing", () => {
+describe("SoDEX EIP-712 Protocol Serialization, Tick Rounding & MetaMask Parity", () => {
   it("preserves exact Go struct key order in Spot BatchNewOrder payloadHash", () => {
     const built = buildSpotOrderPayload({
       accountID: 1010,
@@ -48,6 +54,31 @@ describe("SoDEX EIP-712 Protocol Serialization & Signing", () => {
     );
   });
 
+  it("includes explicit EIP712Domain for MetaMask v4 matching viem digest byte-for-byte", () => {
+    const payloadHash = keccak256(toHex("test-order"));
+    const nonce = 1795550000123;
+    const viemTd = buildExchangeActionTypedData("spot", "testnet", payloadHash, nonce);
+    const mmTd = buildMetaMaskTypedDataV4("spot", "testnet", payloadHash, nonce);
+
+    expect(mmTd.types.EIP712Domain).toHaveLength(4);
+    expect(mmTd.types.EIP712Domain.map((f) => f.name)).toEqual(["name", "version", "chainId", "verifyingContract"]);
+
+    const viemDigest = hashTypedData(viemTd);
+    const mmDigest = hashTypedData({
+      domain: mmTd.domain,
+      types: { ExchangeAction: mmTd.types.ExchangeAction },
+      primaryType: mmTd.primaryType,
+      message: { payloadHash: mmTd.message.payloadHash, nonce: BigInt(mmTd.message.nonce) }
+    });
+    expect(mmDigest).toBe(viemDigest);
+  });
+
+  it("rounds sub-cent prices accurately via symbol tickSize without collapsing to 0.0000", () => {
+    expect(roundToStep(0.00000843, "0.00000001")).toBe("0.00000843");
+    expect(roundToStep(0.38642, "0.0001")).toBe("0.3864");
+    expect(roundToStep(95432.67, "0.1")).toBe("95432.7");
+  });
+
   it("produces verifiable 0x01-prefixed EIP-712 ExchangeAction signature on testnet 138565", async () => {
     const testPrivKey = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
     const built = buildPerpsOrderPayload({
@@ -62,9 +93,10 @@ describe("SoDEX EIP-712 Protocol Serialization & Signing", () => {
     const nonce = 1795550000123;
     const signed = await signExchangeActionWithKey(testPrivKey, "futures", "testnet", built.payloadHash, nonce);
     expect(signed.wireSignature.startsWith("0x01")).toBe(true);
-    expect(signed.wireSignature.length).toBe(134); // 0x01 (4 chars) + 65 bytes (130 hex chars)
+    expect(signed.wireSignature.length).toBe(134);
+    // Normalization must be idempotent
+    expect(normalizeSoDexSignature(signed.wireSignature)).toBe(signed.wireSignature);
 
-    // Convert normalized recovery (00/01) back to 27/28 for viem verifyTypedData check
     const rawBody = signed.wireSignature.slice(4);
     const vNorm = Number.parseInt(rawBody.slice(-2), 16);
     expect([0, 1]).toContain(vNorm);
@@ -82,7 +114,7 @@ describe("SoDEX EIP-712 Protocol Serialization & Signing", () => {
   });
 });
 
-describe("Pre-Trade Risk Firewall", () => {
+describe("Pre-Trade Risk Firewall (Fail-Closed & Edge Cases)", () => {
   const sampleBook: OrderbookSnapshot = {
     marketType: "spot",
     symbol: "vMAG7ssi_vUSDC",
@@ -108,17 +140,43 @@ describe("Pre-Trade Risk Firewall", () => {
   it("approves small well-within-depth order with tight spread", async () => {
     const res = await evaluateTradeFirewall(
       { marketType: "spot", symbol: "vMAG7ssi_vUSDC", side: "BUY", notionalUsd: 500, portfolioTotalUsd: 10_000 },
-      { orderbook: sampleBook, intradayVolPct: 3.1, venueChannelStatus: "clob", referencePrice: 0.3865 }
+      { orderbook: sampleBook, intradayVolPct: 3.1, venueChannelStatus: "clob", referencePrice: 0.3865, assetFound: true }
     );
     expect(res.verdict).toBe("APPROVE");
     expect(res.slippageBps).toBeLessThan(20);
     expect(res.sha256Digest).toHaveLength(64);
   });
 
+  it("returns recommendedMaxUsd === 0 when existing position already exhausts concentration cap", async () => {
+    const res = await evaluateTradeFirewall(
+      {
+        marketType: "spot",
+        symbol: "vMAG7ssi_vUSDC",
+        side: "BUY",
+        notionalUsd: 500,
+        portfolioTotalUsd: 10_000,
+        existingAssetUsd: 4000,
+        maxConcentrationPct: 35
+      },
+      { orderbook: sampleBook, intradayVolPct: 3.1, venueChannelStatus: "clob", referencePrice: 0.3865, assetFound: true }
+    );
+    expect(res.recommendedMaxUsd).toBe(0);
+    expect(res.verdict).not.toBe("APPROVE");
+  });
+
+  it("blocks unknown/unlisted Wealth vaults rather than approving", async () => {
+    const res = await evaluateTradeFirewall(
+      { marketType: "wealth", symbol: "NON_EXISTENT_VAULT", side: "BUY", notionalUsd: 500 },
+      { orderbook: null, intradayVolPct: 4.5, venueChannelStatus: "not_found", referencePrice: 0, assetFound: false }
+    );
+    expect(res.verdict).toBe("BLOCK");
+    expect(res.recommendedMaxUsd).toBe(0);
+  });
+
   it("blocks oversized order exhausting L2 depth & breaching concentration", async () => {
     const res = await evaluateTradeFirewall(
       { marketType: "spot", symbol: "vMAG7ssi_vUSDC", side: "BUY", notionalUsd: 8000, portfolioTotalUsd: 10_000 },
-      { orderbook: sampleBook, intradayVolPct: 4.5, venueChannelStatus: "clob", referencePrice: 0.3865 }
+      { orderbook: sampleBook, intradayVolPct: 4.5, venueChannelStatus: "clob", referencePrice: 0.3865, assetFound: true }
     );
     expect(res.verdict).toBe("BLOCK");
     expect(res.recommendedMaxUsd).toBeLessThan(3000);
@@ -129,14 +187,46 @@ describe("Pre-Trade Risk Firewall", () => {
     expect(sim.filledUsd).toBe(200);
     const res = await evaluateTradeFirewall(
       { marketType: "wealth", symbol: "CXMT", side: "BUY", notionalUsd: 500 },
-      { orderbook: null, intradayVolPct: 2.0, venueChannelStatus: "closed:market_closed", referencePrice: 5.71 }
+      { orderbook: null, intradayVolPct: 2.0, venueChannelStatus: "closed:market_closed", referencePrice: 5.71, assetFound: true }
     );
     expect(res.verdict).toBe("BLOCK");
   });
 });
 
-describe("Quantitative Regime & Walk-Forward Backtest Engine", () => {
-  it("computes deterministic walk-forward metrics, alpha, and bootstrap Monte Carlo VaR", () => {
+describe("On-Chain 8-Decimal SSI Supply, APY Sanitizer & SoSoValue Client", () => {
+  it("scales Base 8-decimal SSI totalSupply accurately (~167M instead of 0.0167)", () => {
+    const raw8Dec = 167_000_000_00000000n;
+    expect(scaleTokenSupply(raw8Dec, 8)).toBe(167_000_000);
+  });
+
+  it("filters pathological APY outliers (>100% such as 215,214%) before LLM synthesis", () => {
+    expect(sanitizeVaultApy(215214.5)).toBeNull();
+    expect(sanitizeVaultApy(-95)).toBeNull();
+    expect(sanitizeVaultApy(8.423)).toBe(8.42);
+  });
+
+  it("sends x-soso-api-key header and unwraps SoSoValue OpenAPI v1 envelopes", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ code: 0, message: "ok", data: ["MAG7", "MEME", "DEFI"] })
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const client = new SoSoValueClient("test-soso-key-123");
+      const indices = await client.getIndices();
+      expect(indices).toEqual(["MAG7", "MEME", "DEFI"]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [calledUrl, calledInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(calledUrl).toBe("https://openapi.sosovalue.com/openapi/v1/indices");
+      expect(new Headers(calledInit.headers).get("x-soso-api-key")).toBe("test-soso-key-123");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("Quantitative Regime (SoSoValue Overlay) & Periodic Backtest Engine", () => {
+  it("drops legs with missing historical points instead of filling with $1 flat prices", () => {
     const dates = Array.from({ length: 20 }, (_, i) => `2026-11-${String(i + 1).padStart(2, "0")}`);
     const mkSeries = (start: number, step: number) =>
       dates.map((date, i) => ({ date, close: Number((start * (1 + step * i)).toFixed(4)) }));
@@ -145,11 +235,13 @@ describe("Quantitative Regime & Walk-Forward Backtest Engine", () => {
       "Unit Test Barbell",
       [
         { symbol: "A", source: "spot", weight: 0.6, label: "Asset A" },
-        { symbol: "B", source: "wealth", weight: 0.4, label: "Asset B" }
+        { symbol: "B", source: "wealth", weight: 0.3, label: "Asset B" },
+        { symbol: "MISSING", source: "spot", weight: 0.1, label: "Empty" }
       ],
       {
         A: { points: mkSeries(100, 0.01), source: "SoDEX Spot CLOB" },
-        B: { points: mkSeries(50, 0.005), source: "SoDEX Wealth API" }
+        B: { points: mkSeries(50, 0.005), source: "SoDEX Wealth API" },
+        MISSING: { points: [], source: "SoDEX Spot CLOB" }
       },
       mkSeries(10, 0.003),
       mkSeries(50000, 0.002),
@@ -157,6 +249,7 @@ describe("Quantitative Regime & Walk-Forward Backtest Engine", () => {
       10
     );
 
+    expect(result.legsEvaluated.map((l) => l.symbol)).toEqual(["A", "B"]);
     expect(result.daysAnalyzed).toBe(20);
     expect(result.totalReturnPct).toBeGreaterThan(10);
     expect(result.alphaVsSsiPct).toBeGreaterThan(0);
@@ -164,18 +257,17 @@ describe("Quantitative Regime & Walk-Forward Backtest Engine", () => {
     expect(result.equityCurve).toHaveLength(20);
   });
 
-  it("detects RISK_ON when breadth and crypto momentum are strong", () => {
-    const regime = detectMarketRegime(
-      [
-        { symbol: "vBTC_vUSDC", lastPx: 60000, openPx: 58000, highPx: 60500, lowPx: 57900, volume: 100, quoteVolume: 6e6, changePct: 3.4, bidPx: 59990, askPx: 60010, spreadBps: 3.3 },
-        { symbol: "vETH_vUSDC", lastPx: 3200, openPx: 3080, highPx: 3220, lowPx: 3070, volume: 200, quoteVolume: 6.4e5, changePct: 3.9, bidPx: 3199, askPx: 3201, spreadBps: 6.2 },
-        { symbol: "vSOL_vUSDC", lastPx: 140, openPx: 135, highPx: 142, lowPx: 134, volume: 300, quoteVolume: 4.2e4, changePct: 3.7, bidPx: 139.9, askPx: 140.1, spreadBps: 14.3 }
-      ],
-      [],
-      []
-    );
-    expect(regime.label).toBe("RISK_ON");
-    expect(regime.breadthAdvancingPct).toBe(100);
+  it("integrates SoSoValue ETF net-flows directly into regime classification & confidence", () => {
+    const borderSpot = [
+      { symbol: "vBTC_vUSDC", lastPx: 60000, openPx: 59700, highPx: 60500, lowPx: 59500, volume: 100, quoteVolume: 6e6, changePct: 0.6, bidPx: 59990, askPx: 60010, spreadBps: 3.3 },
+      { symbol: "vETH_vUSDC", lastPx: 3200, openPx: 3180, highPx: 3220, lowPx: 3160, volume: 200, quoteVolume: 6.4e5, changePct: 0.5, bidPx: 3199, askPx: 3201, spreadBps: 6.2 },
+      { symbol: "vSOL_vUSDC", lastPx: 140, openPx: 139, highPx: 141, lowPx: 138, volume: 300, quoteVolume: 4.2e4, changePct: 0.4, bidPx: 139.9, askPx: 140.1, spreadBps: 14.3 }
+    ];
+    const withoutEtf = detectMarketRegime(borderSpot, [], []);
+    const withBigInflow = detectMarketRegime(borderSpot, [], [], { etfNetInflowUsd: 420_000_000 });
+    expect(withoutEtf.label).toBe("ROTATION");
+    expect(withBigInflow.label).toBe("RISK_ON");
+    expect(withBigInflow.rationale.some((r) => r.includes("SoSoValue BTC Spot ETF"))).toBe(true);
   });
 });
 
@@ -191,16 +283,26 @@ describe("Worker API & MCP JSON-RPC Endpoints", () => {
     const spec = (await oas.json()) as { openapi: string; paths: Record<string, unknown> };
     expect(spec.openapi).toBe("3.0.3");
     expect(spec.paths["/mcp"]).toBeDefined();
+    expect(spec.paths["/api/v1/execution/submit"]).toBeDefined();
   });
 
-  it("handles MCP initialize and tools/list", async () => {
+  it("handles MCP initialize, notifications/initialized (202), and 6 tools including meridian_sosovalue_macro", async () => {
     const init = (await handleMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" })) as {
       result?: { serverInfo?: { name: string } };
     };
     expect(init.result?.serverInfo?.name).toBe("meridian-finance-mcp");
+
+    const notifRes = await app.request("/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })
+    });
+    expect(notifRes.status).toBe(202);
+
     const tools = (await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" })) as {
-      result?: { tools?: unknown[] };
+      result?: { tools?: Array<{ name: string }> };
     };
-    expect(tools.result?.tools?.length).toBeGreaterThanOrEqual(5);
+    expect(tools.result?.tools?.length).toBeGreaterThanOrEqual(6);
+    expect(tools.result?.tools?.some((t) => t.name === "meridian_sosovalue_macro")).toBe(true);
   });
 });

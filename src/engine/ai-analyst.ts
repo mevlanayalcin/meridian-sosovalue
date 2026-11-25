@@ -1,6 +1,5 @@
-import { fetchJson } from "../providers/http";
-import type { MarketOverviewBundle, PublishedThesis } from "../shared/types";
-import { sha256Hex } from "../providers/http";
+import { fetchJson, sha256Hex } from "../providers/http";
+import type { FirewallCheckResult, MarketOverviewBundle, PublishedThesis } from "../shared/types";
 
 interface NimCompletionResponse {
   choices?: Array<{
@@ -11,20 +10,32 @@ interface NimCompletionResponse {
 const DEFAULT_NIM_URL = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b";
 
+export function sanitizeVaultApy(apy: number | null): number | null {
+  if (apy === null || !Number.isFinite(apy)) return null;
+  if (apy < -80 || apy > 100) return null; // Exclude uninitialized/launch spike outliers (e.g. >100% APY)
+  return Number(apy.toFixed(2));
+}
+
 /**
  * Generates an evidence-grounded institutional investment thesis and allocation proposal.
- * Strictly constrains the LLM to verified live metrics from the MarketOverviewBundle,
- * with a deterministic quantitative fallback if no LLM key is configured or on timeout.
+ * Sanitizes anomalous APY inputs before LLM synthesis and binds firewallVerdict directly
+ * to a live evaluateTradeFirewall() verdict rather than a spread stub.
  */
 export async function generateGroundedThesis(
   bundle: MarketOverviewBundle,
   promptFocus: string,
-  nvidiaApiKey?: string
+  nvidiaApiKey?: string,
+  liveFirewall?: FirewallCheckResult | null
 ): Promise<PublishedThesis> {
   const now = new Date().toISOString();
-  const topRwa = [...bundle.wealthFunds]
-    .filter((f) => f.apy7d !== null && f.apy7d > 0 && f.apy7d < 500)
-    .sort((a, b) => (b.apy7d ?? 0) - (a.apy7d ?? 0))[0];
+  const sanitizedWealth = bundle.wealthFunds.map((w) => ({
+    ...w,
+    cleanApy7d: sanitizeVaultApy(w.apy7d),
+    apyAnomalyFiltered: w.apy7d !== null && sanitizeVaultApy(w.apy7d) === null
+  }));
+  const topRwa = [...sanitizedWealth]
+    .filter((f) => f.cleanApy7d !== null && f.cleanApy7d > 0)
+    .sort((a, b) => (b.cleanApy7d ?? 0) - (a.cleanApy7d ?? 0))[0];
   const mag7 = bundle.spotTickers.find((t) => t.symbol === "vMAG7ssi_vUSDC");
   const btcPerp = bundle.perpsTickers.find((t) => t.symbol === "BTC-USD");
   const boxx = bundle.wealthFunds.find((f) => f.fundId === "vBOXX");
@@ -33,8 +44,17 @@ export async function generateGroundedThesis(
     {
       metric: "Market Regime Classification",
       value: `${bundle.regime.label} (${bundle.regime.confidence}% conf, ${bundle.regime.breadthAdvancingPct.toFixed(0)}% advancing)`,
-      source: "SoDEX Spot CLOB"
+      source: bundle.sosoOpenApi.connected ? "SoSoValue OpenAPI v1/v3" : "SoDEX Spot CLOB"
     },
+    ...(bundle.sosoOpenApi.etfNetInflowUsd !== null
+      ? [
+          {
+            metric: "SoSoValue US BTC Spot ETF Net Flow",
+            value: `${bundle.sosoOpenApi.etfNetInflowUsd >= 0 ? "+" : ""}$${(bundle.sosoOpenApi.etfNetInflowUsd / 1_000_000).toFixed(1)}M (${bundle.sosoOpenApi.etfLatestDate ?? "latest"})`,
+            source: "SoSoValue OpenAPI v1/v3" as const
+          }
+        ]
+      : []),
     ...(mag7
       ? [
           {
@@ -47,7 +67,7 @@ export async function generateGroundedThesis(
     ...(btcPerp
       ? [
           {
-            metric: "BTC-USD Perp Mark & OI",
+            metric: "BTC-USD Perp Mark & Funding",
             value: `$${btcPerp.markPx.toLocaleString("en-US", { maximumFractionDigits: 2 })} | Funding ${(btcPerp.fundingRate * 100).toFixed(4)}%`,
             source: "SoDEX Perps CLOB" as const
           }
@@ -57,7 +77,7 @@ export async function generateGroundedThesis(
       ? [
           {
             metric: `SoDEX Wealth ${topRwa.fundId}`,
-            value: `NAV $${topRwa.price.toFixed(4)} | 7d APY ${topRwa.apy7d?.toFixed(2)}%`,
+            value: `NAV $${topRwa.price.toFixed(4)} | 7d APY ${topRwa.cleanApy7d?.toFixed(2)}%`,
             source: "SoDEX Wealth API" as const
           }
         ]
@@ -92,6 +112,12 @@ export async function generateGroundedThesis(
   let aiModel = "meridian-deterministic-quant-v1";
   let parsedAllocation = defaultAllocation;
 
+  const allowedSymbols = new Set([
+    ...bundle.spotTickers.map((s) => s.symbol),
+    ...bundle.perpsTickers.map((p) => p.symbol),
+    ...bundle.wealthFunds.map((w) => w.fundId)
+  ]);
+
   if (nvidiaApiKey) {
     try {
       const compactFacts = {
@@ -110,11 +136,12 @@ export async function generateGroundedThesis(
           chg24h: p.changePct,
           funding: p.fundingRate
         })),
-        wealthFunds: bundle.wealthFunds.slice(0, 8).map((w) => ({
+        wealthFunds: sanitizedWealth.slice(0, 8).map((w) => ({
           id: w.fundId,
           type: w.fundType,
           px: w.price,
-          apy7d: w.apy7d,
+          apy7d: w.cleanApy7d,
+          apyAnomalyFiltered: w.apyAnomalyFiltered,
           roi1M: w.roi1M
         })),
         ssiParity: bundle.ssiParity,
@@ -139,7 +166,7 @@ export async function generateGroundedThesis(
               {
                 role: "system",
                 content:
-                  "You are Meridian's Chief Quantitative Strategist. Return ONLY valid JSON with keys: title (string, <=80 chars), direction (LONG|HEDGE|YIELD_ROTATE|NEUTRAL), conviction (integer 50-95), summary (string, 2-3 concise sentences citing ONLY numbers from the provided JSON), allocation (array of 3-4 {asset, weightPct, venue} summing to 100 using ONLY symbols present in the facts)."
+                  "You are Meridian's Chief Quantitative Strategist. Return ONLY valid JSON with keys: title (string, <=80 chars), direction (LONG|HEDGE|YIELD_ROTATE|NEUTRAL), conviction (integer 50-95), summary (string, 2-3 concise sentences citing ONLY numbers from the provided JSON; never cite null or anomaly-filtered APYs), allocation (array of 3-4 {asset, weightPct, venue} summing to 100 using ONLY symbols present in the facts; in DEFENSIVE regimes cap single RWA/Pre-IPO sleeves <=35% and favor vBOXX/Morpho-Earn)."
               },
               {
                 role: "user",
@@ -155,9 +182,12 @@ export async function generateGroundedThesis(
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]) as Partial<PublishedThesis>;
-        if (parsed.title && parsed.summary) {
+        const summaryStr = String(parsed.summary ?? "");
+        // Reject hallucinated extreme APY strings (>1000%) in LLM output
+        const hasHallucinatedPct = /\b\d{1,3}(?:,\d{3})+%\b/.test(summaryStr);
+        if (parsed.title && parsed.summary && !hasHallucinatedPct) {
           title = String(parsed.title).slice(0, 90);
-          summary = String(parsed.summary).slice(0, 600);
+          summary = summaryStr.slice(0, 600);
           if (
             parsed.direction === "LONG" ||
             parsed.direction === "HEDGE" ||
@@ -171,7 +201,8 @@ export async function generateGroundedThesis(
           }
           if (Array.isArray(parsed.allocation) && parsed.allocation.length >= 2) {
             const totalW = parsed.allocation.reduce((acc, x) => acc + (Number(x.weightPct) || 0), 0);
-            if (totalW > 95 && totalW < 105) {
+            const allValid = parsed.allocation.every((x) => allowedSymbols.has(String(x.asset)));
+            if (totalW > 95 && totalW < 105 && allValid) {
               parsedAllocation = parsed.allocation.map((x) => ({
                 asset: String(x.asset),
                 weightPct: Number(x.weightPct),
@@ -188,8 +219,29 @@ export async function generateGroundedThesis(
   }
 
   const targetAsset = parsedAllocation[0]?.asset ?? "vMAG7ssi_vUSDC";
+  const firewallVerdict: PublishedThesis["firewallVerdict"] =
+    liveFirewall?.verdict ?? (bundle.regime.label === "HIGH_VOL_CAUTION" ? "CAUTION" : "APPROVE");
+
+  if (liveFirewall) {
+    defaultEvidence.push({
+      metric: `Pre-Trade Risk Firewall (${liveFirewall.symbol})`,
+      value: `${liveFirewall.verdict} (risk ${liveFirewall.riskScore}/100, slip ${liveFirewall.slippageBps.toFixed(1)} bps, spread ${liveFirewall.spreadBps.toFixed(1)} bps)`,
+      source: liveFirewall.marketType === "wealth" ? "SoDEX Wealth API" : "SoDEX Spot CLOB"
+    });
+  }
+
   const id = `th_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const bodyForHash = JSON.stringify({ id, now, title, direction, conviction, summary, parsedAllocation, defaultEvidence });
+  const bodyForHash = JSON.stringify({
+    id,
+    now,
+    title,
+    direction,
+    conviction,
+    summary,
+    parsedAllocation,
+    defaultEvidence,
+    firewallVerdict
+  });
   const sha256Digest = await sha256Hex(bodyForHash);
 
   return {
@@ -204,13 +256,8 @@ export async function generateGroundedThesis(
     summary,
     evidence: defaultEvidence,
     allocation: parsedAllocation,
-    firewallVerdict: spreadCheckVerdict(mag7?.spreadBps ?? 15, bundle.regime.label),
+    firewallVerdict,
     sha256Digest,
     aiModel
   };
-}
-
-function spreadCheckVerdict(spreadBps: number, regime: string): PublishedThesis["firewallVerdict"] {
-  if (spreadBps > 80 || regime === "HIGH_VOL_CAUTION") return "CAUTION";
-  return "APPROVE";
 }

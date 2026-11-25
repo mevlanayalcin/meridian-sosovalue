@@ -39,6 +39,24 @@ export interface PerpsOrderSpec {
 }
 
 /**
+ * Rounds a positive decimal number to exact symbol tickSize / stepSize precision
+ * without collapsing sub-cent tokens (e.g. PEPE 0.0000084) to "0.0000".
+ */
+export function roundToStep(value: number, stepStr?: string, fallbackDecimals = 4): string {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  const step = stepStr ? Number.parseFloat(stepStr) : Number.NaN;
+  if (Number.isFinite(step) && step > 0) {
+    const match = stepStr!.trim().match(/\.(\d+)/);
+    const decimals = match ? match[1].replace(/0+$/, "").length : 0;
+    const snapped = Math.round(value / step) * step;
+    const safe = snapped > 0 ? snapped : step;
+    return safe.toFixed(decimals);
+  }
+  const autoDecimals = value < 0.001 ? 8 : value < 1 ? 6 : fallbackDecimals;
+  return value.toFixed(autoDecimals).replace(/\.?0+$/, "");
+}
+
+/**
  * Serializes Spot BatchNewOrderRequest in exact Go struct field order from
  * sodex-tech/sodex-go-sdk-public/spot/types/batch_new_order_request.go.
  */
@@ -93,6 +111,13 @@ export function buildPerpsOrderPayload(spec: PerpsOrderSpec) {
   return { action, params, canonicalJson, payloadHash };
 }
 
+export const EIP712_DOMAIN_TYPE = [
+  { name: "name", type: "string" },
+  { name: "version", type: "string" },
+  { name: "chainId", type: "uint256" },
+  { name: "verifyingContract", type: "address" }
+] as const;
+
 export function buildExchangeActionTypedData(
   domainName: "spot" | "futures",
   network: SoDexNetwork,
@@ -121,12 +146,42 @@ export function buildExchangeActionTypedData(
 }
 
 /**
+ * MetaMask / EIP-1193 `eth_signTypedData_v4` payload including explicit `EIP712Domain`
+ * so browser wallets hash the exact same domain separator as viem & sodex-go-sdk-public.
+ */
+export function buildMetaMaskTypedDataV4(
+  domainName: "spot" | "futures",
+  network: SoDexNetwork,
+  payloadHash: `0x${string}`,
+  nonce: number
+) {
+  const td = buildExchangeActionTypedData(domainName, network, payloadHash, nonce);
+  return {
+    domain: td.domain,
+    types: {
+      EIP712Domain: [...EIP712_DOMAIN_TYPE],
+      ExchangeAction: [...td.types.ExchangeAction]
+    },
+    primaryType: td.primaryType,
+    message: {
+      payloadHash: td.message.payloadHash,
+      nonce: td.message.nonce.toString()
+    }
+  };
+}
+
+/**
  * Normalizes ECDSA recovery v (27/28 -> 00/01) and prepends SoDEX 0x01 typed signature tag.
+ * Idempotent if already prefixed with 0x01 / 0x02 (134 hex chars).
  */
 export function normalizeSoDexSignature(rawSig: `0x${string}`, prefix: "0x01" | "0x02" = "0x01"): `0x${string}` {
-  const vByte = Number.parseInt(rawSig.slice(-2), 16);
+  const clean = rawSig.toLowerCase() as `0x${string}`;
+  if (clean.length === 134 && (clean.startsWith("0x01") || clean.startsWith("0x02"))) {
+    return clean;
+  }
+  const vByte = Number.parseInt(clean.slice(-2), 16);
   const normalizedV = (vByte >= 27 ? vByte - 27 : vByte).toString(16).padStart(2, "0");
-  const wireSig = `${rawSig.slice(0, -2)}${normalizedV}` as `0x${string}`;
+  const wireSig = `${clean.slice(0, -2)}${normalizedV}` as `0x${string}`;
   return concatHex([prefix, wireSig]);
 }
 

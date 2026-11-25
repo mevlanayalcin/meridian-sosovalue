@@ -1,10 +1,17 @@
 import type { DailySeriesPoint } from "../providers/sodex";
 import type { BacktestPoint, BacktestResult, BasketLeg, MarketRegime, PerpsTicker, ProvenanceSource, SpotTicker, WealthFund } from "../shared/types";
 
+export interface RegimeSosoOverlay {
+  etfNetInflowUsd?: number | null;
+  newsSentimentScore?: number | null; // -1..+1 mean headline sentiment
+  fomcHoldOrCutBias?: string | null;
+}
+
 export function detectMarketRegime(
   spot: SpotTicker[],
   perps: PerpsTicker[],
-  wealth: WealthFund[]
+  wealth: WealthFund[],
+  sosoOverlay?: RegimeSosoOverlay
 ): {
   label: MarketRegime;
   confidence: number;
@@ -37,25 +44,54 @@ export function detectMarketRegime(
     activeSpot.slice(0, 15).map((s) => (s.lastPx > 0 ? ((s.highPx - s.lowPx) / s.lastPx) * 100 : 0))
   );
 
+  // Incorporate SoSoValue ETF net-flows and news sentiment directly into signal scoring when available
+  const etfInflowUsd = sosoOverlay?.etfNetInflowUsd ?? null;
+  const newsScore = sosoOverlay?.newsSentimentScore ?? null;
+  let sosoMomentumAdj = 0;
+  let sosoConfidenceBonus = 0;
   const rationale: string[] = [];
+
+  if (etfInflowUsd !== null && Number.isFinite(etfInflowUsd)) {
+    const inflowM = etfInflowUsd / 1_000_000;
+    if (inflowM >= 150) {
+      sosoMomentumAdj += 0.9;
+      sosoConfidenceBonus += 6;
+      rationale.push(`SoSoValue BTC Spot ETF net inflow (+$${inflowM.toFixed(1)}M) reinforces risk appetite.`);
+    } else if (inflowM <= -150) {
+      sosoMomentumAdj -= 0.9;
+      sosoConfidenceBonus += 6;
+      rationale.push(`SoSoValue BTC Spot ETF net outflow ($${inflowM.toFixed(1)}M) increases defensive tilt.`);
+    } else {
+      rationale.push(`SoSoValue BTC Spot ETF flow neutral (${inflowM >= 0 ? "+" : ""}$${inflowM.toFixed(1)}M).`);
+    }
+  }
+  if (newsScore !== null && Number.isFinite(newsScore) && Math.abs(newsScore) >= 0.25) {
+    sosoMomentumAdj += newsScore * 0.45;
+    sosoConfidenceBonus += 3;
+    rationale.push(`Curated news sentiment index ${newsScore >= 0 ? "+" : ""}${newsScore.toFixed(2)} integrated into regime bias.`);
+  }
+
+  const adjustedCryptoMomentum = avgCryptoChange24hPct + sosoMomentumAdj;
   let label: MarketRegime = "ROTATION";
-  let confidence = 70;
+  let confidence = 65;
 
   if (avgIntradaySwing > 11) {
     label = "HIGH_VOL_CAUTION";
-    confidence = Math.min(93, Math.round(68 + avgIntradaySwing * 1.4));
+    confidence = Math.min(95, Math.round(66 + avgIntradaySwing * 1.4 + sosoConfidenceBonus));
     rationale.push(`Elevated 24h cross-asset intraday swing (${avgIntradaySwing.toFixed(1)}%) triggers volatility size throttling.`);
-  } else if (breadthAdvancingPct >= 58 && avgCryptoChange24hPct > 1.0) {
+  } else if (breadthAdvancingPct >= 58 && adjustedCryptoMomentum > 1.0) {
     label = "RISK_ON";
-    confidence = Math.min(94, Math.round(60 + (breadthAdvancingPct - 50) * 0.8 + avgCryptoChange24hPct * 2.5));
+    confidence = Math.min(95, Math.round(58 + (breadthAdvancingPct - 50) * 0.8 + adjustedCryptoMomentum * 2.4 + sosoConfidenceBonus));
     rationale.push(`${breadthAdvancingPct.toFixed(0)}% of SoDEX spot pairs advancing with +${avgCryptoChange24hPct.toFixed(2)}% mean crypto momentum.`);
-  } else if (breadthAdvancingPct <= 40 && avgCryptoChange24hPct < -1.0) {
+  } else if (breadthAdvancingPct <= 40 && adjustedCryptoMomentum < -1.0) {
     label = "DEFENSIVE";
-    confidence = Math.min(92, Math.round(62 + (50 - breadthAdvancingPct) * 0.7 + Math.abs(avgCryptoChange24hPct) * 2));
+    confidence = Math.min(94, Math.round(60 + (50 - breadthAdvancingPct) * 0.7 + Math.abs(adjustedCryptoMomentum) * 2.0 + sosoConfidenceBonus));
     rationale.push(`Broad crypto contraction (${avgCryptoChange24hPct.toFixed(2)}%, ${breadthAdvancingPct.toFixed(0)}% breadth); rotate core capital toward vBOXX/Morpho-Earn yield.`);
   } else {
     label = "ROTATION";
-    confidence = 74;
+    // Data-driven rotation confidence based on dispersion & breadth proximity to 50%
+    const dispersion = Math.abs(avgCryptoChange24hPct - avgEquityTokenChange24hPct);
+    confidence = Math.min(86, Math.max(54, Math.round(60 + Math.min(14, dispersion * 2.2) + (50 - Math.abs(breadthAdvancingPct - 50)) * 0.2 + sosoConfidenceBonus)));
     rationale.push(`Mixed breadth (${breadthAdvancingPct.toFixed(0)}% advancing); barbell between SSI index beta and tokenized RWA/Treasuries captures carry.`);
   }
 
@@ -76,8 +112,9 @@ export function detectMarketRegime(
 }
 
 /**
- * Runs a deterministic walk-forward rebalanced backtest and 500-path bootstrap
+ * Runs a deterministic periodic-rebalanced historical backtest and 500-path bootstrap
  * Monte Carlo VaR(95%) / CVaR(99%) simulation on real SoDEX Spot & Wealth daily series.
+ * Legs with zero historical price points are strictly dropped rather than padded with flat $1 prices.
  */
 export function runBasketBacktest(
   basketName: string,
@@ -88,22 +125,18 @@ export function runBasketBacktest(
   rebalanceIntervalDays = 7,
   feeBps = 10
 ): BacktestResult {
-  // Normalize weights strictly to 1.0
-  const rawSum = legs.reduce((acc, l) => acc + Math.max(0, l.weight), 0) || 1;
-  const normLegs = legs.map((l) => ({ ...l, weight: Math.max(0, l.weight) / rawSum }));
-
-  // Build date -> price lookup per series, only keeping dates present across all active legs
-  const dateSets = normLegs
-    .map((l) => new Set((seriesMap[l.symbol]?.points ?? []).map((p) => p.date)))
-    .filter((s) => s.size > 0);
-
-  if (!dateSets.length) {
+  const validLegs = legs.filter((l) => (seriesMap[l.symbol]?.points?.length ?? 0) >= 2 && l.weight > 0);
+  if (!validLegs.length) {
     throw new Error("No historical series points available for selected basket legs.");
   }
 
+  const rawSum = validLegs.reduce((acc, l) => acc + l.weight, 0);
+  const normLegs = validLegs.map((l) => ({ ...l, weight: l.weight / rawSum }));
+
+  const dateSets = normLegs.map((l) => new Set((seriesMap[l.symbol]?.points ?? []).map((p) => p.date)));
+
   let commonDates = Array.from(dateSets[0]).filter((d) => dateSets.every((set) => set.has(d))).sort();
   if (commonDates.length < 5) {
-    // Fallback to union with forward-fill if one newer RWA vault has fewer dates
     const allDates = new Set<string>();
     for (const l of normLegs) {
       for (const p of seriesMap[l.symbol]?.points ?? []) allDates.add(p.date);
@@ -115,17 +148,17 @@ export function runBasketBacktest(
   const buildFfillMap = (pts: DailySeriesPoint[]) => {
     const rawMap = new Map(pts.map((p) => [p.date, p.close]));
     const filled = new Map<string, number>();
-    let last = pts[0]?.close ?? 1;
+    let last = pts[0]?.close ?? 0;
     for (const d of commonDates) {
       const val = rawMap.get(d);
       if (val !== undefined && val > 0) last = val;
-      filled.set(d, last);
+      if (last > 0) filled.set(d, last);
     }
     return filled;
   };
 
   for (const leg of normLegs) {
-    priceLookup.set(leg.symbol, buildFfillMap(seriesMap[leg.symbol]?.points ?? []));
+    priceLookup.set(leg.symbol, buildFfillMap(seriesMap[leg.symbol].points));
   }
   const ssiMap = buildFfillMap(benchmarkSsiSeries);
   const btcMap = buildFfillMap(benchmarkBtcSeries);
@@ -134,12 +167,12 @@ export function runBasketBacktest(
   let units = new Map<string, number>();
   const d0 = commonDates[0];
   for (const leg of normLegs) {
-    const p0 = priceLookup.get(leg.symbol)?.get(d0) ?? 1;
+    const p0 = priceLookup.get(leg.symbol)?.get(d0) ?? seriesMap[leg.symbol].points[0].close;
     units.set(leg.symbol, (initialVal * leg.weight) / p0);
   }
 
-  const ssiBase = ssiMap.get(d0) ?? 1;
-  const btcBase = btcMap.get(d0) ?? 1;
+  const ssiBase = ssiMap.get(d0) ?? benchmarkSsiSeries[0]?.close ?? 1;
+  const btcBase = btcMap.get(d0) ?? benchmarkBtcSeries[0]?.close ?? 1;
 
   const equityCurve: BacktestPoint[] = [];
   const dailyReturns: number[] = [];
@@ -151,15 +184,14 @@ export function runBasketBacktest(
     const d = commonDates[i];
     let nav = 0;
     for (const leg of normLegs) {
-      const px = priceLookup.get(leg.symbol)?.get(d) ?? 1;
+      const px = priceLookup.get(leg.symbol)?.get(d) ?? seriesMap[leg.symbol].points[0].close;
       nav += (units.get(leg.symbol) ?? 0) * px;
     }
 
-    // Periodic walk-forward rebalance with turnover transaction cost
     if (i > 0 && i % rebalanceIntervalDays === 0) {
       let turnover = 0;
       for (const leg of normLegs) {
-        const px = priceLookup.get(leg.symbol)?.get(d) ?? 1;
+        const px = priceLookup.get(leg.symbol)?.get(d) ?? seriesMap[leg.symbol].points[0].close;
         const curVal = (units.get(leg.symbol) ?? 0) * px;
         const targetVal = nav * leg.weight;
         turnover += Math.abs(targetVal - curVal);
@@ -168,7 +200,7 @@ export function runBasketBacktest(
       nav = Math.max(0.01, nav - feeCost);
       const nextUnits = new Map<string, number>();
       for (const leg of normLegs) {
-        const px = priceLookup.get(leg.symbol)?.get(d) ?? 1;
+        const px = priceLookup.get(leg.symbol)?.get(d) ?? seriesMap[leg.symbol].points[0].close;
         nextUnits.set(leg.symbol, (nav * leg.weight) / px);
       }
       units = nextUnits;
@@ -216,12 +248,11 @@ export function runBasketBacktest(
     ? (dailyReturns.filter((r) => r > 0).length / dailyReturns.length) * 100
     : 50;
 
-  // Deterministic 500-path 30-day bootstrap Monte Carlo VaR(95%) & CVaR(99%)
   const { var95Pct, cvar99Pct } = runDeterministicBootstrapMc(dailyReturns, 30, 500);
 
   const legsEvaluated = normLegs.map((leg) => {
     const map = priceLookup.get(leg.symbol)!;
-    const first = map.get(commonDates[0]) ?? 1;
+    const first = map.get(commonDates[0]) ?? seriesMap[leg.symbol].points[0].close;
     const last = map.get(commonDates[commonDates.length - 1]) ?? first;
     return {
       symbol: leg.symbol,
@@ -256,7 +287,6 @@ export function runBasketBacktest(
 
 function runDeterministicBootstrapMc(dailyReturns: number[], horizonDays: number, paths: number): { var95Pct: number; cvar99Pct: number } {
   if (!dailyReturns.length) return { var95Pct: 0, cvar99Pct: 0 };
-  // LCG PRNG for reproducible institutional stress test numbers across identical inputs
   let seed = 42_1337;
   const nextRand = () => {
     seed = (seed * 1664525 + 1013904223) % 4294967296;

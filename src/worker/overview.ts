@@ -26,7 +26,6 @@ export async function buildMarketOverview(opts: {
   }
 
   const ssiParity = await computeSsiParity(sodexPriceMap);
-  const regime = detectMarketRegime(spotTickers, perpsTickers, wealthFunds);
 
   const provenanceSet = new Set<ProvenanceSource>([
     "SoDEX Spot CLOB",
@@ -97,6 +96,17 @@ export async function buildMarketOverview(opts: {
       sosoOpenApi.errorNote = err instanceof Error ? err.message : "SoSoValue OpenAPI request failed";
     }
   }
+
+  // Feed SoSoValue ETF flows and news sentiment directly into market regime classification
+  const sentimentNumeric: number[] = newsFeed.map((n) => (n.sentiment === "BULLISH" ? 1 : n.sentiment === "BEARISH" ? -1 : 0));
+  const newsSentimentScore = sentimentNumeric.length
+    ? sentimentNumeric.reduce((a, b) => a + b, 0) / sentimentNumeric.length
+    : null;
+
+  const regime = detectMarketRegime(spotTickers, perpsTickers, wealthFunds, {
+    etfNetInflowUsd: sosoOpenApi.etfNetInflowUsd,
+    newsSentimentScore
+  });
 
   return {
     timestamp: new Date().toISOString(),

@@ -86,6 +86,9 @@ export default function App() {
   const [fwSide, setFwSide] = useState<"BUY" | "SELL">("BUY");
   const [fwOrderType, setFwOrderType] = useState<"LIMIT" | "MARKET">("LIMIT");
   const [fwNotionalUsd, setFwNotionalUsd] = useState(450);
+  const [fwPortfolioUsd, setFwPortfolioUsd] = useState(10_000);
+  const [fwExistingUsd, setFwExistingUsd] = useState(0);
+  const [fwAccountId, setFwAccountId] = useState(1001);
   const [fwMaxSlippage, setFwMaxSlippage] = useState(60);
   const [fwMaxConc, setFwMaxConc] = useState(35);
   const [fwResult, setFwResult] = useState<FirewallCheckResult | null>(null);
@@ -93,6 +96,8 @@ export default function App() {
   const [preparedOrder, setPreparedOrder] = useState<Record<string, unknown> | null>(null);
   const [walletAddr, setWalletAddr] = useState<string | null>(null);
   const [walletSig, setWalletSig] = useState<string | null>(null);
+  const [submitReceipt, setSubmitReceipt] = useState<string | null>(null);
+  const [submittingOrder, setSubmittingOrder] = useState(false);
   const [audits, setAudits] = useState<Array<Record<string, unknown>>>([]);
   const [runningFw, setRunningFw] = useState(false);
 
@@ -204,6 +209,7 @@ export default function App() {
   async function handleRunFirewall(prepareEip712 = true) {
     setRunningFw(true);
     setWalletSig(null);
+    setSubmitReceipt(null);
     setErrorMsg(null);
     try {
       const fwRes = await apiFetch<FirewallCheckResult>("/api/v1/firewall/check", {
@@ -214,7 +220,8 @@ export default function App() {
           symbol: fwSymbol,
           side: fwSide,
           notionalUsd: fwNotionalUsd,
-          portfolioTotalUsd: 10_000,
+          portfolioTotalUsd: fwPortfolioUsd,
+          existingAssetUsd: fwExistingUsd,
           maxSlippageBps: fwMaxSlippage,
           maxConcentrationPct: fwMaxConc
         })
@@ -225,7 +232,7 @@ export default function App() {
 
       if (prepareEip712 && fwMarketType !== "wealth") {
         const refPx = fwRes.data.midPrice || 1;
-        const qty = (fwNotionalUsd / Math.max(0.0001, refPx)).toFixed(4);
+        const qty = (fwNotionalUsd / Math.max(1e-9, refPx)).toPrecision(6);
         const prep = await apiFetch<Record<string, unknown>>("/api/v1/execution/prepare", {
           method: "POST",
           headers: apiHeaders,
@@ -235,9 +242,13 @@ export default function App() {
             symbol: fwSymbol,
             side: fwSide,
             orderType: fwOrderType,
-            price: refPx.toFixed(4),
+            price: fwOrderType === "LIMIT" ? String(refPx) : undefined,
             quantity: qty,
-            accountID: 1001,
+            accountID: fwAccountId,
+            portfolioTotalUsd: fwPortfolioUsd,
+            existingAssetUsd: fwExistingUsd,
+            maxSlippageBps: fwMaxSlippage,
+            maxConcentrationPct: fwMaxConc,
             simulateEphemeralSign: true
           })
         });
@@ -258,7 +269,7 @@ export default function App() {
   async function handleWalletSign() {
     const eth = (window as unknown as { ethereum?: { request: (a: { method: string; params?: unknown[] }) => Promise<unknown> } }).ethereum;
     if (!eth) {
-      setErrorMsg("No browser EIP-1193 wallet detected. Ephemeral Testnet Signature is pre-generated below for verification.");
+      setErrorMsg("No browser EIP-1193 wallet detected. Ephemeral key signature is shown for format inspection only (not an authorized SoDEX account).");
       return;
     }
     if (!preparedOrder?.typedData) return;
@@ -266,14 +277,51 @@ export default function App() {
       const accounts = (await eth.request({ method: "eth_requestAccounts" })) as string[];
       const addr = accounts[0];
       setWalletAddr(addr);
-      const td = preparedOrder.typedData as Record<string, unknown>;
-      const sig = (await eth.request({
+      const td = preparedOrder.typedData as { domain?: { chainId?: number } };
+      const targetChainId = td.domain?.chainId ?? (fwNetwork === "mainnet" ? 286623 : 138565);
+      await eth
+        .request({ method: "wallet_switchEthereumChain", params: [{ chainId: `0x${targetChainId.toString(16)}` }] })
+        .catch(() => undefined);
+      const rawSig = (await eth.request({
         method: "eth_signTypedData_v4",
         params: [addr, JSON.stringify(td)]
       })) as string;
-      setWalletSig(sig);
+      const vByte = Number.parseInt(rawSig.slice(-2), 16);
+      const vNorm = (vByte >= 27 ? vByte - 27 : vByte).toString(16).padStart(2, "0");
+      setWalletSig(`0x01${rawSig.slice(2, -2)}${vNorm}`);
     } catch (e) {
       setErrorMsg(e instanceof Error ? e.message : "Wallet signature cancelled");
+    }
+  }
+
+  async function handleSubmitSignedOrder() {
+    if (!preparedOrder || preparedOrder.blocked || !walletSig) return;
+    setSubmittingOrder(true);
+    setSubmitReceipt(null);
+    setErrorMsg(null);
+    try {
+      const res = await apiFetch<unknown>("/api/v1/execution/submit", {
+        method: "POST",
+        headers: apiHeaders,
+        body: JSON.stringify({
+          network: preparedOrder.network,
+          marketType: fwMarketType,
+          symbol: fwSymbol,
+          side: fwSide,
+          notionalUsd: fwNotionalUsd,
+          portfolioTotalUsd: fwPortfolioUsd,
+          existingAssetUsd: fwExistingUsd,
+          httpBody: preparedOrder.httpBody,
+          wireSignature: walletSig,
+          nonce: preparedOrder.nonce
+        })
+      });
+      if (!res.ok) throw new Error(res.error ?? "SoDEX order relay rejected");
+      setSubmitReceipt(JSON.stringify(res.data, null, 2));
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : "Order submission failed");
+    } finally {
+      setSubmittingOrder(false);
     }
   }
 
@@ -999,6 +1047,36 @@ export default function App() {
                   </div>
                 </div>
 
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div>
+                    <label className="text-[10px] text-slate-400">Portfolio ($)</label>
+                    <input
+                      type="number"
+                      value={fwPortfolioUsd}
+                      onChange={(e) => setFwPortfolioUsd(Number(e.target.value))}
+                      className="mt-1 w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-slate-400">Existing Pos ($)</label>
+                    <input
+                      type="number"
+                      value={fwExistingUsd}
+                      onChange={(e) => setFwExistingUsd(Number(e.target.value))}
+                      className="mt-1 w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-slate-400">Account ID</label>
+                    <input
+                      type="number"
+                      value={fwAccountId}
+                      onChange={(e) => setFwAccountId(Number(e.target.value))}
+                      className="mt-1 w-full px-2 py-1.5 rounded bg-slate-950 border border-slate-700 font-mono"
+                    />
+                  </div>
+                </div>
+
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-slate-400">Order Type</span>
                   <select
@@ -1092,33 +1170,55 @@ export default function App() {
                       <Cpu className="w-4 h-4 text-cyan-400" />
                       SoDEX Go-Struct Exact EIP-712 ExchangeAction
                     </h3>
-                    <button
-                      onClick={() => void handleWalletSign()}
-                      disabled={Boolean(preparedOrder.blocked)}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-500 hover:bg-violet-400 text-white text-xs font-semibold disabled:opacity-40 transition"
-                    >
-                      <Wallet className="w-3.5 h-3.5" />
-                      <span>{preparedOrder.blocked ? "Blocked by Firewall" : "Sign with Browser Wallet"}</span>
-                    </button>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => void handleWalletSign()}
+                        disabled={Boolean(preparedOrder.blocked)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-violet-500 hover:bg-violet-400 text-white text-xs font-semibold disabled:opacity-40 transition"
+                      >
+                        <Wallet className="w-3.5 h-3.5" />
+                        <span>{preparedOrder.blocked ? "Blocked by Firewall" : "Sign with Browser Wallet"}</span>
+                      </button>
+                      {walletSig && !preparedOrder.blocked && (
+                        <button
+                          onClick={() => void handleSubmitSignedOrder()}
+                          disabled={submittingOrder}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold disabled:opacity-40 transition"
+                        >
+                          <span>{submittingOrder ? "Submitting..." : `Submit to SoDEX ${String(preparedOrder.network)}`}</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] font-mono">
-                    <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 overflow-x-auto">
-                      <div className="text-slate-400 mb-1">Canonical Go-Order JSON &amp; Keccak256</div>
-                      <div className="text-cyan-300 break-all mb-2">{String(preparedOrder.payloadHash)}</div>
-                      <pre className="text-slate-300 whitespace-pre-wrap break-all">{String(preparedOrder.canonicalJson)}</pre>
+                  {preparedOrder.blocked ? (
+                    <div className="p-3 rounded-lg bg-rose-500/10 border border-rose-500/40 text-xs text-rose-200 font-mono">
+                      FAIL-CLOSED: Pre-Trade Risk Firewall returned BLOCK — signable EIP-712 payload withheld. Reduce order size to ≤ ${fwResult?.recommendedMaxUsd.toFixed(2) ?? "0"}.
                     </div>
-                    <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 overflow-x-auto">
-                      <div className="text-slate-400 mb-1">
-                        {walletSig ? `Wallet Signed (${walletAddr?.slice(0, 10)}…)` : "Ephemeral Testnet Wire Signature (0x01...)"}
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px] font-mono">
+                      <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 overflow-x-auto">
+                        <div className="text-slate-400 mb-1">Canonical Go-Order JSON &amp; Keccak256</div>
+                        <div className="text-cyan-300 break-all mb-2">{String(preparedOrder.payloadHash)}</div>
+                        <pre className="text-slate-300 whitespace-pre-wrap break-all">{String(preparedOrder.canonicalJson)}</pre>
                       </div>
-                      <div className="text-emerald-300 break-all mb-2">
-                        {walletSig || String((preparedOrder.demoSigned as { wireSignature?: string })?.wireSignature || "")}
+                      <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 overflow-x-auto">
+                        <div className="text-slate-400 mb-1">
+                          {walletSig ? `Wallet Signed (${walletAddr?.slice(0, 10)}…)` : "Ephemeral Format-Preview Signature (Not for Live Relay)"}
+                        </div>
+                        <div className="text-emerald-300 break-all mb-2">
+                          {walletSig || String((preparedOrder.demoSigned as { wireSignature?: string })?.wireSignature || "")}
+                        </div>
+                        <div className="text-slate-400">Target Endpoint:</div>
+                        <div className="text-slate-300 break-all">{String(preparedOrder.endpoint)}</div>
+                        {submitReceipt && (
+                          <pre className="mt-2 p-2 rounded bg-emerald-950/50 border border-emerald-500/30 text-emerald-200 whitespace-pre-wrap">
+                            {submitReceipt}
+                          </pre>
+                        )}
                       </div>
-                      <div className="text-slate-400">Target Endpoint:</div>
-                      <div className="text-slate-300 break-all">{String(preparedOrder.endpoint)}</div>
                     </div>
-                  </div>
+                  )}
                 </div>
               )}
 
@@ -1162,6 +1262,7 @@ export default function App() {
                   className="flex-1 px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-700 font-mono text-xs"
                 >
                   <option value="meridian_market_regime">meridian_market_regime</option>
+                  <option value="meridian_sosovalue_macro">meridian_sosovalue_macro</option>
                   <option value="meridian_check_trade_firewall">meridian_check_trade_firewall</option>
                   <option value="meridian_ssi_parity">meridian_ssi_parity</option>
                   <option value="meridian_wealth_opportunities">meridian_wealth_opportunities</option>

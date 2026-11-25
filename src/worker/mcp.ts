@@ -1,4 +1,5 @@
 import { SoDexClient } from "../providers/sodex";
+import { SoSoValueClient } from "../providers/sosovalue";
 import { computeSsiParity } from "../providers/onchain";
 import { detectMarketRegime, runBasketBacktest } from "../engine/quant";
 import { evaluateTradeFirewall } from "../engine/firewall";
@@ -15,8 +16,19 @@ const MCP_TOOLS = [
   {
     name: "meridian_market_regime",
     description:
-      "Compute live cross-asset crypto, tokenized US equity, and RWA market regime across SoDEX Spot, Perps, and Wealth.",
+      "Compute live cross-asset crypto, tokenized US equity, and RWA market regime across SoDEX Spot, Perps, Wealth, and SoSoValue ETF flows (when key configured).",
     inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "meridian_sosovalue_macro",
+    description:
+      "Query live SoSoValue OpenAPI v1 BTC Spot ETF net flows, FOMC probabilities, and index registry using server or request x-soso-api-key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        symbol: { type: "string", description: "ETF asset symbol, e.g. BTC or ETH" }
+      }
+    }
   },
   {
     name: "meridian_check_trade_firewall",
@@ -29,6 +41,8 @@ const MCP_TOOLS = [
         symbol: { type: "string", description: "e.g. vMAG7ssi_vUSDC, BTC-USD, CXMT" },
         side: { type: "string", enum: ["BUY", "SELL"] },
         notionalUsd: { type: "number" },
+        portfolioTotalUsd: { type: "number" },
+        existingAssetUsd: { type: "number" },
         maxSlippageBps: { type: "number" }
       },
       required: ["symbol", "side", "notionalUsd"]
@@ -37,7 +51,7 @@ const MCP_TOOLS = [
   {
     name: "meridian_ssi_parity",
     description:
-      "Inspect Base mainnet SSI Protocol on-chain token supply & DEX prices vs SoDEX CLOB prices to detect parity spreads.",
+      "Inspect Base mainnet SSI Protocol on-chain token supply (8-decimal native) & DEX prices vs SoDEX CLOB prices to detect parity spreads.",
     inputSchema: { type: "object", properties: {} }
   },
   {
@@ -47,7 +61,7 @@ const MCP_TOOLS = [
   },
   {
     name: "meridian_backtest_basket",
-    description: "Run a walk-forward historical backtest & Monte Carlo VaR/CVaR stress test across SoDEX Spot and Wealth assets.",
+    description: "Run a periodic-rebalanced historical backtest & 500-path bootstrap Monte Carlo VaR/CVaR stress test across SoDEX Spot and Wealth assets.",
     inputSchema: {
       type: "object",
       properties: {
@@ -69,7 +83,12 @@ const MCP_TOOLS = [
   }
 ];
 
-export async function handleMcpRequest(reqBody: JsonRpcRequest) {
+export async function handleMcpRequest(reqBody: JsonRpcRequest, opts?: { sosoApiKey?: string }) {
+  // Per JSON-RPC 2.0 & MCP spec, notifications (no id, e.g. notifications/initialized) return no error payload
+  if (reqBody.method.startsWith("notifications/") || (reqBody.method === "initialized" && reqBody.id === undefined)) {
+    return null;
+  }
+
   const id = reqBody.id ?? null;
   const sodex = new SoDexClient();
 
@@ -79,10 +98,14 @@ export async function handleMcpRequest(reqBody: JsonRpcRequest) {
       id,
       result: {
         protocolVersion: "2024-11-05",
-        serverInfo: { name: "meridian-finance-mcp", version: "1.0.0" },
+        serverInfo: { name: "meridian-finance-mcp", version: "1.1.0" },
         capabilities: { tools: {} }
       }
     };
+  }
+
+  if (reqBody.method === "ping") {
+    return { jsonrpc: "2.0", id, result: {} };
   }
 
   if (reqBody.method === "tools/list") {
@@ -101,7 +124,30 @@ export async function handleMcpRequest(reqBody: JsonRpcRequest) {
         sodex.getPerpsTickers(),
         sodex.getWealthFunds()
       ]);
-      payload = detectMarketRegime(spot, perps, wealth);
+      let etfNetInflowUsd: number | null = null;
+      if (opts?.sosoApiKey) {
+        const soso = new SoSoValueClient(opts.sosoApiKey);
+        const hist = await soso.getEtfSummaryHistory("BTC", "US", 3).catch(() => []);
+        etfNetInflowUsd = hist[0]?.total_net_inflow ?? null;
+      }
+      payload = detectMarketRegime(spot, perps, wealth, { etfNetInflowUsd });
+    } else if (name === "meridian_sosovalue_macro") {
+      if (!opts?.sosoApiKey) {
+        payload = {
+          connected: false,
+          error: "Pass x-soso-api-key HTTP header (or configure server SOSOVALUE_API_KEY) to query live SoSoValue OpenAPI v1 ETF/FOMC feeds."
+        };
+      } else {
+        const soso = new SoSoValueClient(opts.sosoApiKey);
+        const sym = String(args.symbol ?? "BTC").toUpperCase();
+        const [overview, etfHistory, indices, fomc] = await Promise.all([
+          soso.getMarketOverview().catch(() => null),
+          soso.getEtfSummaryHistory(sym, "US", 5).catch(() => []),
+          soso.getIndices().catch(() => []),
+          soso.getFomcProbabilities().catch(() => null)
+        ]);
+        payload = { connected: true, symbol: sym, overview, etfHistory, indices, fomc };
+      }
     } else if (name === "meridian_ssi_parity") {
       const spot = await sodex.getSpotTickers();
       const map = Object.fromEntries(spot.map((s) => [s.symbol, { lastPx: s.lastPx, spreadBps: s.spreadBps }]));
@@ -117,22 +163,33 @@ export async function handleMcpRequest(reqBody: JsonRpcRequest) {
       let refPx = book?.midPrice ?? 0;
       let volPct = 3.5;
       let channel = "clob";
+      let assetFound = true;
       if (marketType === "wealth") {
         const funds = await sodex.getWealthFunds();
         const f = funds.find((x) => x.fundId === symbol);
-        refPx = f?.price ?? 1;
-        channel = f?.channel ?? "unknown";
+        assetFound = Boolean(f);
+        refPx = f?.price ?? 0;
+        channel = f?.channel ?? "not_found";
       } else {
         const ticks = marketType === "spot" ? await sodex.getSpotTickers() : await sodex.getPerpsTickers();
         const t = ticks.find((x) => x.symbol === symbol);
+        assetFound = Boolean(t || book);
         if (t && t.lastPx > 0) {
           refPx = t.lastPx;
           volPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
         }
       }
       payload = await evaluateTradeFirewall(
-        { marketType, symbol, side, notionalUsd, maxSlippageBps: Number(args.maxSlippageBps ?? 60) },
-        { orderbook: book, intradayVolPct: volPct, venueChannelStatus: channel, referencePrice: refPx }
+        {
+          marketType,
+          symbol,
+          side,
+          notionalUsd,
+          portfolioTotalUsd: args.portfolioTotalUsd !== undefined ? Number(args.portfolioTotalUsd) : undefined,
+          existingAssetUsd: args.existingAssetUsd !== undefined ? Number(args.existingAssetUsd) : undefined,
+          maxSlippageBps: Number(args.maxSlippageBps ?? 60)
+        },
+        { orderbook: book, intradayVolPct: volPct, venueChannelStatus: channel, referencePrice: refPx, assetFound }
       );
     } else if (name === "meridian_backtest_basket") {
       const legs: BasketLeg[] = Array.isArray(args.legs)

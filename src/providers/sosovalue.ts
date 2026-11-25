@@ -43,8 +43,8 @@ export interface SosoFomcProbabilities {
 }
 
 /**
- * Full client for SoSoValue OpenAPI v1 (/openapi/v1) and Market Data v3 (/openapi/v3).
- * Uses `x-soso-api-key` authentication per official GitBook OpenAPI 3.0 spec.
+ * Active client for SoSoValue OpenAPI v1 endpoints wired into Meridian's overview,
+ * regime classifier, thesis synthesis, and MCP tools.
  */
 export class SoSoValueClient {
   constructor(private readonly apiKey: string) {}
@@ -64,27 +64,13 @@ export class SoSoValueClient {
   }
 
   getEtfSummaryHistory(symbol = "BTC", country = "US", limit = 15): Promise<SosoEtfSummaryRow[]> {
-    return this.request(`/openapi/v1/etfs/summary-history?symbol=${encodeURIComponent(symbol)}&country_code=${encodeURIComponent(country)}&limit=${limit}`);
-  }
-
-  getEtfs(symbol = "BTC", country = "US"): Promise<Array<{ ticker: string; name: string; exchange: string }>> {
-    return this.request(`/openapi/v1/etfs?symbol=${encodeURIComponent(symbol)}&country_code=${encodeURIComponent(country)}`);
+    return this.request(
+      `/openapi/v1/etfs/summary-history?symbol=${encodeURIComponent(symbol)}&country_code=${encodeURIComponent(country)}&limit=${limit}`
+    );
   }
 
   getIndices(): Promise<string[]> {
     return this.request("/openapi/v1/indices");
-  }
-
-  getIndexConstituents(ticker: string): Promise<Array<{ currency_id: string; symbol: string; weight: number }>> {
-    return this.request(`/openapi/v1/indices/${encodeURIComponent(ticker)}/constituents`);
-  }
-
-  getIndexSnapshot(ticker: string): Promise<{ price: number; change_pct_24h: number; roi_7d: number; roi_1m: number; ytd: number }> {
-    return this.request(`/openapi/v1/indices/${encodeURIComponent(ticker)}/market-snapshot`);
-  }
-
-  getNews(pageSize = 10): Promise<{ list: SosoNewsItem[]; total: number }> {
-    return this.request(`/openapi/v1/news?page=1&page_size=${pageSize}`);
   }
 
   getHotNews(pageSize = 10): Promise<{ list: SosoNewsItem[]; total: number }> {
@@ -93,25 +79,5 @@ export class SoSoValueClient {
 
   getFomcProbabilities(): Promise<SosoFomcProbabilities> {
     return this.request("/openapi/v1/macro/fomc-probabilities");
-  }
-
-  getMacroRates(): Promise<unknown> {
-    return this.request("/openapi/v1/macro/rates");
-  }
-
-  getMacroEvents(): Promise<unknown> {
-    return this.request("/openapi/v1/macro/events");
-  }
-
-  getCryptoStocks(): Promise<unknown> {
-    return this.request("/openapi/v1/crypto-stocks");
-  }
-
-  getBtcTreasuries(): Promise<unknown> {
-    return this.request("/openapi/v1/btc-treasuries");
-  }
-
-  getV3Instruments(type = "equity", expand = "quote", pageSize = 20): Promise<unknown> {
-    return this.request(`/openapi/v3/instruments?type=${encodeURIComponent(type)}&expand=${encodeURIComponent(expand)}&page_size=${pageSize}`);
   }
 }

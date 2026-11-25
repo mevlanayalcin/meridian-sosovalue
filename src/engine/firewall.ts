@@ -6,6 +6,7 @@ export interface FirewallContext {
   intradayVolPct: number;
   venueChannelStatus: string;
   referencePrice: number;
+  assetFound?: boolean;
 }
 
 /**
@@ -70,55 +71,79 @@ export async function evaluateTradeFirewall(
 ): Promise<FirewallCheckResult> {
   const maxSlippageBps = req.maxSlippageBps ?? 60;
   const maxConcentrationPct = req.maxConcentrationPct ?? 35;
-  const portfolioTotal = Math.max(req.portfolioTotalUsd ?? 10_000, req.notionalUsd);
-  const existingAssetUsd = req.existingAssetUsd ?? 0;
+  const portfolioTotal = Math.max(req.portfolioTotalUsd ?? 10_000, 1);
+  const existingAssetUsd = Math.max(0, req.existingAssetUsd ?? 0);
 
   const postTradeUsd = req.side === "BUY" ? existingAssetUsd + req.notionalUsd : Math.max(0, existingAssetUsd - req.notionalUsd);
-  const postTradeConcentrationPct = Number(((postTradeUsd / portfolioTotal) * 100).toFixed(2));
+  const effectivePortfolio = Math.max(portfolioTotal, postTradeUsd);
+  const postTradeConcentrationPct = Number(((postTradeUsd / effectivePortfolio) * 100).toFixed(2));
+
+  const assetMissing =
+    ctx.assetFound === false ||
+    ctx.venueChannelStatus === "unknown" ||
+    ctx.venueChannelStatus === "not_found" ||
+    (ctx.referencePrice <= 0 && (!ctx.orderbook || ctx.orderbook.midPrice <= 0));
 
   const book = ctx.orderbook;
   const midPrice = book && book.midPrice > 0 ? book.midPrice : ctx.referencePrice;
-  const spreadBps = book ? book.spreadBps : req.marketType === "wealth" ? 12 : 9999;
+  const isWealthModel = req.marketType === "wealth";
+  const spreadBps = assetMissing ? 9999 : book ? book.spreadBps : isWealthModel ? 12 : 9999;
 
   const sim =
-    book && req.marketType !== "wealth"
-      ? simulateBookFill(req.side === "BUY" ? book.asks : book.bids, req.notionalUsd, midPrice, req.side, maxSlippageBps)
-      : {
-          vwapPrice: midPrice,
-          slippageBps: req.marketType === "wealth" ? 10 : 9999,
-          filledUsd: req.notionalUsd,
-          maxSafeUsd: req.marketType === "wealth" ? 25_000 : 0
-        };
+    assetMissing
+      ? { vwapPrice: 0, slippageBps: 9999, filledUsd: 0, maxSafeUsd: 0 }
+      : book && !isWealthModel
+        ? simulateBookFill(req.side === "BUY" ? book.asks : book.bids, req.notionalUsd, midPrice, req.side, maxSlippageBps)
+        : {
+            vwapPrice: midPrice,
+            slippageBps: isWealthModel ? 10 : 9999,
+            filledUsd: isWealthModel ? req.notionalUsd : 0,
+            maxSafeUsd: isWealthModel ? 25_000 : 0
+          };
 
   const checks: FirewallCheckResult["checks"] = [];
   let riskScore = 0;
 
-  // 1. Venue channel availability
-  const channelClosed = ctx.venueChannelStatus.startsWith("closed") || ctx.venueChannelStatus === "HALT";
+  // 1. Venue channel & symbol existence
+  const channelClosed =
+    assetMissing ||
+    ctx.venueChannelStatus.startsWith("closed") ||
+    ctx.venueChannelStatus === "HALT";
   checks.push({
-    name: "Venue Session & Channel",
+    name: "Venue Session & Asset Registry",
     status: channelClosed ? "FAIL" : "PASS",
-    observed: ctx.venueChannelStatus,
-    threshold: "open / rfq / clob / trading",
-    detail: channelClosed
-      ? "Market channel is currently closed or halted; order execution must wait for active session."
-      : "Target venue execution channel is live and accepting orders."
+    observed: assetMissing ? "asset_not_found" : ctx.venueChannelStatus,
+    threshold: "listed & open / rfq / clob / trading",
+    detail: assetMissing
+      ? `Symbol or vault "${req.symbol}" was not found on target ${req.marketType} venue.`
+      : channelClosed
+        ? "Market channel is currently closed or halted; order execution must wait for active session."
+        : "Target venue execution channel is live and accepting orders."
   });
-  if (channelClosed) riskScore += 45;
+  if (channelClosed) riskScore += 55;
 
   // 2. Orderbook slippage & depth sufficiency
-  const slipStatus = sim.slippageBps > maxSlippageBps * 2 || sim.filledUsd < req.notionalUsd * 0.99 ? "FAIL" : sim.slippageBps > maxSlippageBps ? "WARN" : "PASS";
+  const slipStatus =
+    assetMissing || sim.slippageBps > maxSlippageBps * 2 || sim.filledUsd < req.notionalUsd * 0.99
+      ? "FAIL"
+      : sim.slippageBps > maxSlippageBps
+        ? "WARN"
+        : "PASS";
   checks.push({
-    name: "L2 Depth & Execution Slippage",
+    name: isWealthModel ? "Vault Liquidity (Modeled Estimate)" : "L2 Depth & Execution Slippage",
     status: slipStatus,
-    observed: `${sim.slippageBps.toFixed(1)} bps ($${sim.filledUsd.toFixed(0)}/${req.notionalUsd.toFixed(0)} filled)`,
+    observed: isWealthModel
+      ? `~${sim.slippageBps.toFixed(1)} bps modeled estimate (non-CLOB vault)`
+      : `${sim.slippageBps.toFixed(1)} bps ($${sim.filledUsd.toFixed(0)}/${req.notionalUsd.toFixed(0)} filled)`,
     threshold: `<= ${maxSlippageBps} bps`,
     detail:
       slipStatus === "FAIL"
-        ? `Order exceeds live L2 depth within ${maxSlippageBps} bps; safe max size is $${sim.maxSafeUsd.toFixed(0)}.`
+        ? `Order exceeds available depth within ${maxSlippageBps} bps; safe max size is $${sim.maxSafeUsd.toFixed(0)}.`
         : slipStatus === "WARN"
           ? `Elevated price impact (${sim.slippageBps.toFixed(1)} bps); consider splitting into TWAP slices.`
-          : `Sufficient L2 depth at VWAP $${sim.vwapPrice.toFixed(4)}.`
+          : isWealthModel
+            ? `Modeled vault NAV execution estimate at $${sim.vwapPrice.toFixed(4)} (no live CLOB book).`
+            : `Sufficient L2 depth at VWAP $${sim.vwapPrice.toFixed(4)}.`
   });
   if (slipStatus === "FAIL") riskScore += 40;
   else if (slipStatus === "WARN") riskScore += 20;
@@ -126,16 +151,18 @@ export async function evaluateTradeFirewall(
   // 3. Bid-ask spread guard
   const spreadStatus = spreadBps > 120 ? "FAIL" : spreadBps > 45 ? "WARN" : "PASS";
   checks.push({
-    name: "Top-of-Book Bid/Ask Spread",
+    name: isWealthModel ? "Vault Spread (Modeled Estimate)" : "Top-of-Book Bid/Ask Spread",
     status: spreadStatus,
-    observed: `${spreadBps.toFixed(1)} bps`,
+    observed: isWealthModel && !assetMissing ? `~${spreadBps.toFixed(1)} bps modeled estimate` : `${spreadBps.toFixed(1)} bps`,
     threshold: "<= 45 bps optimal / 120 bps hard cap",
     detail:
       spreadStatus === "FAIL"
         ? "Spread exceeds 120 bps hard ceiling; use resting limit orders rather than market taker."
         : spreadStatus === "WARN"
           ? "Moderately wide spread; post-only GTC limit recommended."
-          : "Tight institutional spread on SoDEX CLOB."
+          : isWealthModel
+            ? "Modeled vault spread within mandate threshold."
+            : "Tight institutional spread on SoDEX CLOB."
   });
   if (spreadStatus === "FAIL") riskScore += 25;
   else if (spreadStatus === "WARN") riskScore += 10;
@@ -145,9 +172,9 @@ export async function evaluateTradeFirewall(
   const volAdjustedThreshold = leverage > 3 ? 6 : 12;
   const volStatus = ctx.intradayVolPct > volAdjustedThreshold * 1.5 ? "FAIL" : ctx.intradayVolPct > volAdjustedThreshold ? "WARN" : "PASS";
   checks.push({
-    name: "24h Volatility & Leverage Regime",
+    name: isWealthModel ? "Volatility Regime (Vault Category Est.)" : "24h Volatility & Leverage Regime",
     status: volStatus,
-    observed: `${ctx.intradayVolPct.toFixed(2)}% range (${leverage}x lev)`,
+    observed: `${ctx.intradayVolPct.toFixed(2)}% ${isWealthModel ? "est. category" : "observed"} range (${leverage}x lev)`,
     threshold: `<= ${volAdjustedThreshold}% intraday range`,
     detail:
       volStatus === "FAIL"
@@ -167,7 +194,7 @@ export async function evaluateTradeFirewall(
   checks.push({
     name: "Portfolio Concentration Cap",
     status: concStatus,
-    observed: `${postTradeConcentrationPct.toFixed(1)}% post-trade`,
+    observed: `${postTradeConcentrationPct.toFixed(1)}% post-trade ($${postTradeUsd.toFixed(0)} / $${effectivePortfolio.toFixed(0)})`,
     threshold: `<= ${maxConcentrationPct}% max single asset`,
     detail:
       concStatus === "FAIL"
@@ -182,11 +209,14 @@ export async function evaluateTradeFirewall(
   const hasWarn = checks.some((c) => c.status === "WARN");
   const verdict: FirewallCheckResult["verdict"] = hasFail || riskScore >= 55 ? "BLOCK" : hasWarn || riskScore >= 25 ? "CAUTION" : "APPROVE";
 
+  // Strictly respect 0 headroom when existing position already hits/exceeds cap (no `0 || x` bug)
   const concentrationMaxUsd = Math.max(0, (maxConcentrationPct / 100) * portfolioTotal - existingAssetUsd);
-  const recommendedMaxUsd =
-    req.marketType === "wealth"
-      ? Number(Math.min(req.notionalUsd, concentrationMaxUsd || req.notionalUsd).toFixed(2))
-      : Number(Math.max(0, Math.min(sim.maxSafeUsd, req.side === "BUY" ? concentrationMaxUsd || sim.maxSafeUsd : sim.maxSafeUsd)).toFixed(2));
+  const buyCapUsd = req.side === "BUY" ? concentrationMaxUsd : Number.POSITIVE_INFINITY;
+  const recommendedMaxUsd = assetMissing || channelClosed
+    ? 0
+    : isWealthModel
+      ? Number(Math.max(0, Math.min(req.notionalUsd, sim.maxSafeUsd, buyCapUsd)).toFixed(2))
+      : Number(Math.max(0, Math.min(sim.maxSafeUsd, buyCapUsd)).toFixed(2));
 
   const id = `fw_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
   const createdAt = new Date().toISOString();
@@ -210,10 +240,15 @@ export async function evaluateTradeFirewall(
     spreadBps,
     intradayVolPct: Number(ctx.intradayVolPct.toFixed(2)),
     postTradeConcentrationPct,
-    bookImbalance: book ? book.imbalanceRatio : 0,
+    bookImbalance: book?.imbalanceRatio ?? 0,
     venueChannelStatus: ctx.venueChannelStatus,
     checks,
     sha256Digest,
-    source: req.marketType === "wealth" ? "SoDEX Wealth API" : req.marketType === "perps" ? "SoDEX Perps CLOB" : "SoDEX Spot CLOB"
+    source:
+      req.marketType === "spot"
+        ? "SoDEX Spot CLOB"
+        : req.marketType === "perps"
+          ? "SoDEX Perps CLOB"
+          : "SoDEX Wealth API"
   };
 }
