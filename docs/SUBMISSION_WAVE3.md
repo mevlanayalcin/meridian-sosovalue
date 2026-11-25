@@ -26,5 +26,5 @@ Meridian enables a single operator to run an institutional research agency, inde
 
 ## 4. Wave 3 Progress Update / Changelog
 - Built and deployed full-stack Cloudflare Workers + D1 SQLite + React 19 production terminal (`https://meridian.bedir-ai.workers.dev`) with scheduled 6h Cron thesis generation.
-- Added live SoDEX Wealth RWA & Pre-IPO vault intelligence (`CXMT`, `UNITREE`, `Morpho-Earn`) with APY anomaly sanitization (`[-80%, 100%]`) and cross-venue Base SSI parity detection using live ERC-20 `decimals()`.
-- Implemented fail-closed L2 orderbook Pre-Trade Risk Firewall, Go-struct-exact SoDEX EIP-712 signing with MetaMask `EIP712Domain` parity and `tickSize`/`stepSize` rounding, walk-forward + Monte Carlo backtest engine, and 6-tool JSON-RPC MCP server (`16/16` unit/integration tests passing).
+- Added live SoDEX Wealth RWA & Pre-IPO vault intelligence (`CXMT`, `UNITREE`, `Morpho-Earn`) with APY anomaly sanitization (`[-25%, 40%]`) and cross-venue Base SSI parity detection using atomic Multicall3 ERC-20 `decimals()` + `totalSupply()`.
+- Implemented fail-closed L2 orderbook Pre-Trade Risk Firewall (with 15% Limit Price Collar, live `HALT` checks, Wealth size caps, and signed `httpBody` server-side re-verification), Go-struct-exact SoDEX EIP-712 signing with MetaMask `EIP712Domain` parity and trailing-zero-free `tickSize`/`stepSize` rounding, periodic-rebalanced + Monte Carlo backtest engine, and 6-tool JSON-RPC MCP server (`19/19` unit/integration tests passing).

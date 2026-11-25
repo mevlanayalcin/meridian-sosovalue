@@ -231,6 +231,7 @@ export default function App() {
       setFwResult(fwRes.data);
 
       if (prepareEip712 && fwMarketType !== "wealth") {
+        setPreparedOrder(null);
         const refPx = fwRes.data.midPrice || 1;
         const qty = (fwNotionalUsd / Math.max(1e-9, refPx)).toPrecision(6);
         const prep = await apiFetch<Record<string, unknown>>("/api/v1/execution/prepare", {
@@ -252,7 +253,12 @@ export default function App() {
             simulateEphemeralSign: true
           })
         });
-        if (prep.ok && prep.data) setPreparedOrder(prep.data);
+        if (prep.ok && prep.data) {
+          setPreparedOrder(prep.data);
+        } else {
+          setPreparedOrder(null);
+          setErrorMsg(prep.error ?? "Failed to prepare order payload");
+        }
       } else {
         setPreparedOrder(null);
       }
@@ -279,9 +285,27 @@ export default function App() {
       setWalletAddr(addr);
       const td = preparedOrder.typedData as { domain?: { chainId?: number } };
       const targetChainId = td.domain?.chainId ?? (fwNetwork === "mainnet" ? 286623 : 138565);
-      await eth
-        .request({ method: "wallet_switchEthereumChain", params: [{ chainId: `0x${targetChainId.toString(16)}` }] })
-        .catch(() => undefined);
+      const chainHex = `0x${targetChainId.toString(16)}`;
+      try {
+        await eth.request({ method: "wallet_switchEthereumChain", params: [{ chainId: chainHex }] });
+      } catch (switchErr) {
+        const code = (switchErr as { code?: number })?.code;
+        if (code === 4902) {
+          await eth.request({
+            method: "wallet_addEthereumChain",
+            params: [
+              {
+                chainId: chainHex,
+                chainName: targetChainId === 286623 ? "ValueChain Mainnet" : "ValueChain Testnet",
+                nativeCurrency: { name: "SOSO", symbol: "SOSO", decimals: 18 },
+                rpcUrls: [targetChainId === 286623 ? "https://mainnet.valuechain.xyz" : "https://testnet.valuechain.xyz"]
+              }
+            ]
+          });
+        } else {
+          throw new Error(`Please switch your wallet to ValueChain (${targetChainId}) before signing.`);
+        }
+      }
       const rawSig = (await eth.request({
         method: "eth_signTypedData_v4",
         params: [addr, JSON.stringify(td)]

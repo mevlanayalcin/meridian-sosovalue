@@ -34,7 +34,9 @@ export function detectMarketRegime(
   const avgCryptoChange24hPct = avg(cryptoRows.map((s) => s.changePct));
   const avgEquityTokenChange24hPct = avg(eqRows.map((s) => s.changePct));
 
-  const validApy = wealth.map((w) => w.apy7d).filter((v): v is number => v !== null && v > -50 && v < 100);
+  const validApy = wealth
+    .map((w) => w.apy7d)
+    .filter((v): v is number => v !== null && Number.isFinite(v) && v >= -25 && v <= 40);
   const avgRwaApyPct = avg(validApy);
 
   const validFunding = perps.slice(0, 20).map((p) => p.fundingRate * 10_000);

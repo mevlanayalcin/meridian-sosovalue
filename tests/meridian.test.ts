@@ -11,7 +11,7 @@ import {
 } from "../src/engine/sodex-eip712";
 import { evaluateTradeFirewall, simulateBookFill } from "../src/engine/firewall";
 import { detectMarketRegime, runBasketBacktest } from "../src/engine/quant";
-import { sanitizeVaultApy } from "../src/engine/ai-analyst";
+import { hasHallucinatedPercentage, sanitizeVaultApy } from "../src/engine/ai-analyst";
 import { scaleTokenSupply } from "../src/providers/onchain";
 import { SoSoValueClient } from "../src/providers/sosovalue";
 import { handleMcpRequest } from "../src/worker/mcp";
@@ -73,9 +73,11 @@ describe("SoDEX EIP-712 Protocol Serialization, Tick Rounding & MetaMask Parity"
     expect(mmDigest).toBe(viemDigest);
   });
 
-  it("rounds sub-cent prices accurately via symbol tickSize without collapsing to 0.0000", () => {
+  it("rounds prices & quantities via symbol tickSize/stepSize and strips trailing zeros for SoDEX API", () => {
     expect(roundToStep(0.00000843, "0.00000001")).toBe("0.00000843");
-    expect(roundToStep(0.38642, "0.0001")).toBe("0.3864");
+    expect(roundToStep(0.386, "0.0001")).toBe("0.386");
+    expect(roundToStep(0.001, "0.00001")).toBe("0.001");
+    expect(roundToStep(50, "0.00001")).toBe("50");
     expect(roundToStep(95432.67, "0.1")).toBe("95432.7");
   });
 
@@ -182,7 +184,7 @@ describe("Pre-Trade Risk Firewall (Fail-Closed & Edge Cases)", () => {
     expect(res.recommendedMaxUsd).toBeLessThan(3000);
   });
 
-  it("blocks orders on closed venue channels", async () => {
+  it("blocks orders on closed or HALT venue channels", async () => {
     const sim = simulateBookFill(sampleBook.asks, 200, 0.3865, "BUY", 60);
     expect(sim.filledUsd).toBe(200);
     const res = await evaluateTradeFirewall(
@@ -190,6 +192,30 @@ describe("Pre-Trade Risk Firewall (Fail-Closed & Edge Cases)", () => {
       { orderbook: null, intradayVolPct: 2.0, venueChannelStatus: "closed:market_closed", referencePrice: 5.71, assetFound: true }
     );
     expect(res.verdict).toBe("BLOCK");
+
+    const halted = await evaluateTradeFirewall(
+      { marketType: "spot", symbol: "vAMD_vUSDC", side: "BUY", notionalUsd: 200 },
+      { orderbook: sampleBook, intradayVolPct: 2.0, venueChannelStatus: "HALT", referencePrice: 0.3865, assetFound: true }
+    );
+    expect(halted.verdict).toBe("BLOCK");
+  });
+
+  it("blocks off-market limit price collar bypasses (e.g. SELL at 99% below mid)", async () => {
+    const res = await evaluateTradeFirewall(
+      { marketType: "spot", symbol: "vMAG7ssi_vUSDC", side: "SELL", notionalUsd: 500, portfolioTotalUsd: 100_000 },
+      { orderbook: sampleBook, intradayVolPct: 2.5, venueChannelStatus: "NORMAL", referencePrice: 0.3865, assetFound: true, limitPrice: 0.01 }
+    );
+    expect(res.verdict).toBe("BLOCK");
+    expect(res.checks.some((c) => c.name.includes("Price Collar") && c.status === "FAIL")).toBe(true);
+  });
+
+  it("blocks oversized Wealth vault orders exceeding single-clip cap (e.g. $5M SELL UNITREE)", async () => {
+    const res = await evaluateTradeFirewall(
+      { marketType: "wealth", symbol: "UNITREE", side: "SELL", notionalUsd: 5_000_000, portfolioTotalUsd: 10_000_000 },
+      { orderbook: null, intradayVolPct: 4.5, venueChannelStatus: "rfq", referencePrice: 5.2, assetFound: true }
+    );
+    expect(res.verdict).toBe("BLOCK");
+    expect(res.recommendedMaxUsd).toBe(25_000);
   });
 });
 
@@ -199,10 +225,14 @@ describe("On-Chain 8-Decimal SSI Supply, APY Sanitizer & SoSoValue Client", () =
     expect(scaleTokenSupply(raw8Dec, 8)).toBe(167_000_000);
   });
 
-  it("filters pathological APY outliers (>100% such as 215,214%) before LLM synthesis", () => {
+  it("filters pathological APY outliers & equity 7d swings and catches >=1000% LLM hallucinations", () => {
     expect(sanitizeVaultApy(215214.5)).toBeNull();
-    expect(sanitizeVaultApy(-95)).toBeNull();
+    expect(sanitizeVaultApy(-64.58)).toBeNull();
     expect(sanitizeVaultApy(8.423)).toBe(8.42);
+    expect(hasHallucinatedPercentage("UNITREE offers 215,214% APY right now.")).toBe(true);
+    expect(hasHallucinatedPercentage("Annualized return of 61,338.43% APY")).toBe(true);
+    expect(hasHallucinatedPercentage("Extreme 215214% yield")).toBe(true);
+    expect(hasHallucinatedPercentage("Morpho-Earn carries 8.42% APY")).toBe(false);
   });
 
   it("sends x-soso-api-key header and unwraps SoSoValue OpenAPI v1 envelopes", async () => {

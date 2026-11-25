@@ -7,6 +7,7 @@ export interface FirewallContext {
   venueChannelStatus: string;
   referencePrice: number;
   assetFound?: boolean;
+  limitPrice?: number;
 }
 
 /**
@@ -105,10 +106,16 @@ export async function evaluateTradeFirewall(
   let riskScore = 0;
 
   // 1. Venue channel & symbol existence
+  const statusNorm = (ctx.venueChannelStatus || "").toLowerCase();
   const channelClosed =
     assetMissing ||
-    ctx.venueChannelStatus.startsWith("closed") ||
-    ctx.venueChannelStatus === "HALT";
+    statusNorm.startsWith("closed") ||
+    statusNorm === "halt" ||
+    statusNorm === "halted" ||
+    statusNorm === "suspended" ||
+    statusNorm === "paused" ||
+    statusNorm === "inactive" ||
+    statusNorm === "delisted";
   checks.push({
     name: "Venue Session & Asset Registry",
     status: channelClosed ? "FAIL" : "PASS",
@@ -117,35 +124,58 @@ export async function evaluateTradeFirewall(
     detail: assetMissing
       ? `Symbol or vault "${req.symbol}" was not found on target ${req.marketType} venue.`
       : channelClosed
-        ? "Market channel is currently closed or halted; order execution must wait for active session."
+        ? `Market channel (${ctx.venueChannelStatus}) is currently closed or halted; order execution is blocked.`
         : "Target venue execution channel is live and accepting orders."
   });
   if (channelClosed) riskScore += 55;
 
-  // 2. Orderbook slippage & depth sufficiency
+  // 1b. Limit price deviation collar (prevents off-market limit orders bypassing notional/slippage controls)
+  if (!assetMissing && ctx.limitPrice !== undefined && Number.isFinite(ctx.limitPrice) && ctx.limitPrice > 0 && midPrice > 0) {
+    const devPct = (Math.abs(ctx.limitPrice - midPrice) / midPrice) * 100;
+    const collarFail = devPct > 15;
+    const collarWarn = !collarFail && devPct > 5;
+    checks.push({
+      name: "Limit Price Collar vs Live Mid",
+      status: collarFail ? "FAIL" : collarWarn ? "WARN" : "PASS",
+      observed: `$${ctx.limitPrice.toFixed(4)} vs mid $${midPrice.toFixed(4)} (${devPct.toFixed(1)}% off-market)`,
+      threshold: "<= 15.0% hard collar (5.0% warn)",
+      detail: collarFail
+        ? `Limit price deviates ${devPct.toFixed(1)}% from live mid price; blocked to prevent fat-finger or notional bypass.`
+        : collarWarn
+          ? `Limit price is ${devPct.toFixed(1)}% away from live mid; verify intentional resting placement.`
+          : "Limit price is tightly aligned with live orderbook mid."
+    });
+    if (collarFail) riskScore += 55;
+    else if (collarWarn) riskScore += 15;
+  }
+
+  // 2. Orderbook slippage, depth sufficiency & Wealth size cap
+  const wealthOversized = isWealthModel && !assetMissing && req.notionalUsd > sim.maxSafeUsd;
   const slipStatus =
-    assetMissing || sim.slippageBps > maxSlippageBps * 2 || sim.filledUsd < req.notionalUsd * 0.99
+    assetMissing || wealthOversized || sim.slippageBps > maxSlippageBps * 2 || sim.filledUsd < req.notionalUsd * 0.99
       ? "FAIL"
       : sim.slippageBps > maxSlippageBps
         ? "WARN"
         : "PASS";
   checks.push({
-    name: isWealthModel ? "Vault Liquidity (Modeled Estimate)" : "L2 Depth & Execution Slippage",
+    name: isWealthModel ? "Vault Liquidity & Size Cap (Modeled)" : "L2 Depth & Execution Slippage",
     status: slipStatus,
     observed: isWealthModel
-      ? `~${sim.slippageBps.toFixed(1)} bps modeled estimate (non-CLOB vault)`
+      ? `$${req.notionalUsd.toFixed(0)} vs $${sim.maxSafeUsd.toFixed(0)} max single-clip (~${sim.slippageBps.toFixed(1)} bps est.)`
       : `${sim.slippageBps.toFixed(1)} bps ($${sim.filledUsd.toFixed(0)}/${req.notionalUsd.toFixed(0)} filled)`,
-    threshold: `<= ${maxSlippageBps} bps`,
+    threshold: isWealthModel ? `<= $${sim.maxSafeUsd.toFixed(0)} single-clip / ${maxSlippageBps} bps` : `<= ${maxSlippageBps} bps`,
     detail:
-      slipStatus === "FAIL"
-        ? `Order exceeds available depth within ${maxSlippageBps} bps; safe max size is $${sim.maxSafeUsd.toFixed(0)}.`
-        : slipStatus === "WARN"
-          ? `Elevated price impact (${sim.slippageBps.toFixed(1)} bps); consider splitting into TWAP slices.`
-          : isWealthModel
-            ? `Modeled vault NAV execution estimate at $${sim.vwapPrice.toFixed(4)} (no live CLOB book).`
-            : `Sufficient L2 depth at VWAP $${sim.vwapPrice.toFixed(4)}.`
+      wealthOversized
+        ? `Wealth order $${req.notionalUsd.toFixed(0)} exceeds modeled single-clip cap ($${sim.maxSafeUsd.toFixed(0)}); split into staged tranches.`
+        : slipStatus === "FAIL"
+          ? `Order exceeds available depth within ${maxSlippageBps} bps; safe max size is $${sim.maxSafeUsd.toFixed(0)}.`
+          : slipStatus === "WARN"
+            ? `Elevated price impact (${sim.slippageBps.toFixed(1)} bps); consider splitting into TWAP slices.`
+            : isWealthModel
+              ? `Modeled vault NAV execution estimate at $${sim.vwapPrice.toFixed(4)} within $${sim.maxSafeUsd.toFixed(0)} single-clip cap.`
+              : `Sufficient L2 depth at VWAP $${sim.vwapPrice.toFixed(4)}.`
   });
-  if (slipStatus === "FAIL") riskScore += 40;
+  if (slipStatus === "FAIL") riskScore += 45;
   else if (slipStatus === "WARN") riskScore += 20;
 
   // 3. Bid-ask spread guard

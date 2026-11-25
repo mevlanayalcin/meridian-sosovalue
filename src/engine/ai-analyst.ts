@@ -12,8 +12,14 @@ const DEFAULT_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b";
 
 export function sanitizeVaultApy(apy: number | null): number | null {
   if (apy === null || !Number.isFinite(apy)) return null;
-  if (apy < -80 || apy > 100) return null; // Exclude uninitialized/launch spike outliers (e.g. >100% APY)
+  if (apy < -25 || apy > 40) return null; // Exclude non-yield annualized 7d equity swings & launch outliers
   return Number(apy.toFixed(2));
+}
+
+export function hasHallucinatedPercentage(text: string): boolean {
+  // Flags >=1,000% (with or without commas or decimals), e.g. "215,214%", "61338.43%"
+  const matches = text.match(/(?:^|[^\d])(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?%/g);
+  return Boolean(matches && matches.length > 0);
 }
 
 /**
@@ -183,9 +189,7 @@ export async function generateGroundedThesis(
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]) as Partial<PublishedThesis>;
         const summaryStr = String(parsed.summary ?? "");
-        // Reject hallucinated extreme APY strings (>1000%) in LLM output
-        const hasHallucinatedPct = /\b\d{1,3}(?:,\d{3})+%\b/.test(summaryStr);
-        if (parsed.title && parsed.summary && !hasHallucinatedPct) {
+        if (parsed.title && parsed.summary && !hasHallucinatedPercentage(summaryStr)) {
           title = String(parsed.title).slice(0, 90);
           summary = summaryStr.slice(0, 600);
           if (
@@ -209,6 +213,14 @@ export async function generateGroundedThesis(
                 venue: String(x.venue || "SoDEX")
               }));
             }
+          }
+          // Enforce direction / allocation coherence: HEDGE or YIELD_ROTATE must not allocate >60% to high-beta crypto/equities
+          const defensiveSet = new Set(["vBOXX", "vBOXX_vUSDC", "Morpho-Earn", "vXAUt_vUSDC", "vUSDT_vUSDC"]);
+          const defWeight = parsedAllocation
+            .filter((a) => defensiveSet.has(a.asset))
+            .reduce((acc, a) => acc + a.weightPct, 0);
+          if ((direction === "HEDGE" || direction === "YIELD_ROTATE") && defWeight < 40) {
+            direction = bundle.regime.label === "RISK_ON" ? "LONG" : "NEUTRAL";
           }
           aiModel = DEFAULT_MODEL;
         }

@@ -151,11 +151,11 @@ export class SoDexClient {
       .sort((a, b) => b.quoteVolume - a.quoteVolume);
   }
 
-  async getSpotSymbols(): Promise<Array<{ id: number; name: string; minNotional: string; maxNotional: string; tickSize: string; stepSize: string }>> {
+  async getSpotSymbols(): Promise<Array<{ id: number; name: string; status?: string; minNotional: string; maxNotional: string; tickSize: string; stepSize: string }>> {
     return this.get("/spot/markets/symbols");
   }
 
-  async getPerpsSymbols(): Promise<Array<{ id: number; name: string; minNotional: string; maxNotional: string; maxLeverage: number; tickSize: string; stepSize: string }>> {
+  async getPerpsSymbols(): Promise<Array<{ id: number; name: string; status?: string; minNotional: string; maxNotional: string; maxLeverage: number; tickSize: string; stepSize: string }>> {
     return this.get("/perps/markets/symbols");
   }
 

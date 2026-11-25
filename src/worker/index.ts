@@ -75,33 +75,58 @@ app.get("/api/v1/orderbook/:marketType/:symbol", async (c) => {
   }
 });
 
-async function runFirewallWithLiveData(req: FirewallCheckRequest): Promise<FirewallCheckResult> {
-  const sodex = new SoDexClient();
-  const book = req.marketType === "wealth" ? null : await sodex.getOrderbook(req.marketType, req.symbol, 50).catch(() => null);
+async function runFirewallWithLiveData(
+  req: FirewallCheckRequest,
+  opts?: { network?: SoDexNetwork; limitPrice?: number }
+): Promise<FirewallCheckResult> {
+  const network: SoDexNetwork = opts?.network === "testnet" ? "testnet" : "mainnet";
+  const netClient = new SoDexClient(network === "mainnet" ? SODEX_MAINNET : SODEX_TESTNET);
+  const mainnetClient = new SoDexClient(SODEX_MAINNET);
+
+  const book =
+    req.marketType === "wealth"
+      ? null
+      : (await netClient.getOrderbook(req.marketType, req.symbol, 50).catch(() => null)) ??
+        (network === "testnet" ? await mainnetClient.getOrderbook(req.marketType, req.symbol, 50).catch(() => null) : null);
+
   let refPx = book?.midPrice ?? 0;
   let intradayVolPct = 3.2;
   let channelStatus = "clob";
   let assetFound = true;
 
   if (req.marketType === "wealth") {
-    const funds = await sodex.getWealthFunds();
+    const funds = await mainnetClient.getWealthFunds();
     const f = funds.find((x) => x.fundId === req.symbol);
     assetFound = Boolean(f);
     refPx = f?.price ?? 0;
     channelStatus = f?.channel ?? "not_found";
     intradayVolPct = f?.fundType === "bridged_vault" ? 0.5 : 4.5;
   } else if (req.marketType === "spot") {
-    const tickers = await sodex.getSpotTickers();
+    const [tickers, symbols] = await Promise.all([
+      netClient.getSpotTickers().catch(() => mainnetClient.getSpotTickers()),
+      netClient.getSpotSymbols().catch(() => mainnetClient.getSpotSymbols())
+    ]);
     const t = tickers.find((x) => x.symbol === req.symbol);
-    assetFound = Boolean(t || book);
+    const symMeta = symbols.find((s) => s.name === req.symbol);
+    assetFound = Boolean(symMeta || t || book);
+    if (symMeta?.status) {
+      channelStatus = symMeta.status;
+    }
     if (t && t.lastPx > 0) {
       refPx = t.lastPx;
       intradayVolPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
     }
   } else {
-    const tickers = await sodex.getPerpsTickers();
+    const [tickers, symbols] = await Promise.all([
+      netClient.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers()),
+      netClient.getPerpsSymbols().catch(() => mainnetClient.getPerpsSymbols())
+    ]);
     const t = tickers.find((x) => x.symbol === req.symbol);
-    assetFound = Boolean(t || book);
+    const symMeta = symbols.find((s) => s.name === req.symbol);
+    assetFound = Boolean(symMeta || t || book);
+    if (symMeta?.status) {
+      channelStatus = symMeta.status;
+    }
     if (t && t.lastPx > 0) {
       refPx = t.lastPx;
       intradayVolPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
@@ -113,7 +138,8 @@ async function runFirewallWithLiveData(req: FirewallCheckRequest): Promise<Firew
     intradayVolPct,
     venueChannelStatus: channelStatus,
     referencePrice: refPx,
-    assetFound
+    assetFound,
+    limitPrice: opts?.limitPrice
   });
 }
 
@@ -184,7 +210,10 @@ app.post("/api/v1/backtest", async (c) => {
       Promise.all(
         legs.map(async (l) => ({
           symbol: l.symbol,
-          points: l.source === "wealth" ? await sodex.getWealthPriceHistory(l.symbol, "3M") : await sodex.getKlines("spot", l.symbol, "1d", 60),
+          points:
+            l.source === "wealth"
+              ? await sodex.getWealthPriceHistory(l.symbol, "3M").catch(() => [])
+              : await sodex.getKlines("spot", l.symbol, "1d", 60).catch(() => []),
           source: l.source === "wealth" ? ("SoDEX Wealth API" as const) : ("SoDEX Spot CLOB" as const)
         }))
       ),
@@ -289,22 +318,39 @@ app.post("/api/v1/theses/generate", async (c) => {
       tavilyApiKey: c.env?.TAVILY_API_KEY
     });
 
-    // Run real Pre-Trade Risk Firewall on the lead SSI instrument so firewallVerdict is live & verifiable
-    const leadSymbol = bundle.spotTickers.find((s) => s.symbol === "vMAG7ssi_vUSDC")?.symbol ?? bundle.spotTickers[0]?.symbol ?? "vMAG7ssi_vUSDC";
+    const draftThesis: PublishedThesis = await generateGroundedThesis(
+      bundle,
+      body.focus?.trim() || "Cross-asset SSI Index & RWA Capital Allocation",
+      c.env?.NVIDIA_API_KEY,
+      null
+    );
+
+    // Run real Pre-Trade Risk Firewall on the thesis's ACTUAL lead target asset
+    const leadSymbol = draftThesis.targetAsset || "vMAG7ssi_vUSDC";
+    const isWealthLead = bundle.wealthFunds.some((w) => w.fundId === leadSymbol);
+    const isPerpsLead = !isWealthLead && bundle.perpsTickers.some((p) => p.symbol === leadSymbol);
     const liveFw = await runFirewallWithLiveData({
-      marketType: "spot",
+      marketType: isWealthLead ? "wealth" : isPerpsLead ? "perps" : "spot",
       symbol: leadSymbol,
       side: "BUY",
       notionalUsd: 1000,
       portfolioTotalUsd: 10_000
     }).catch(() => null);
 
-    const thesis: PublishedThesis = await generateGroundedThesis(
-      bundle,
-      body.focus?.trim() || "Cross-asset SSI Index & RWA Capital Allocation",
-      c.env?.NVIDIA_API_KEY,
-      liveFw
-    );
+    const thesis: PublishedThesis = liveFw
+      ? {
+          ...draftThesis,
+          firewallVerdict: liveFw.verdict,
+          evidence: [
+            ...draftThesis.evidence,
+            {
+              metric: `Pre-Trade Risk Firewall (${liveFw.symbol})`,
+              value: `${liveFw.verdict} (risk ${liveFw.riskScore}/100, slip ${liveFw.slippageBps.toFixed(1)} bps, spread ${liveFw.spreadBps.toFixed(1)} bps)`,
+              source: liveFw.source
+            }
+          ]
+        }
+      : draftThesis;
 
     await persistThesis(c.env?.DB, thesis);
     return c.json({ ok: true, data: thesis });
@@ -356,37 +402,51 @@ app.post("/api/v1/execution/prepare", async (c) => {
       return c.json({ ok: false, error: "Order quantity must be a positive number." }, 400);
     }
 
-    // Resolve real reference price for MARKET orders (never default to $1!)
-    let refPx = Number.parseFloat(body.price || "0");
-    if (body.orderType === "MARKET" || !Number.isFinite(refPx) || refPx <= 0) {
-      const book = await mainnetClient.getOrderbook(body.marketType, body.symbol, 20).catch(() => null);
-      if (book && book.midPrice > 0) {
-        refPx = book.midPrice;
-      } else {
-        const ticks =
-          body.marketType === "spot"
-            ? await mainnetClient.getSpotTickers().catch(() => [])
-            : await mainnetClient.getPerpsTickers().catch(() => []);
-        const matched = ticks.find((t) => t.symbol === body.symbol);
-        refPx = matched?.lastPx ?? 0;
-      }
+    // ALWAYS resolve live market reference price so an off-market limit price (e.g. SELL 50 BTC @ $1)
+    // cannot shrink notional or bypass the Pre-Trade Risk Firewall!
+    let liveMidPx = 0;
+    const book =
+      (await client.getOrderbook(body.marketType, body.symbol, 20).catch(() => null)) ??
+      (network === "testnet" ? await mainnetClient.getOrderbook(body.marketType, body.symbol, 20).catch(() => null) : null);
+    if (book && book.midPrice > 0) {
+      liveMidPx = book.midPrice;
+    } else {
+      const ticks =
+        body.marketType === "spot"
+          ? await client.getSpotTickers().catch(() => mainnetClient.getSpotTickers().catch(() => []))
+          : await client.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers().catch(() => []));
+      const matched = ticks.find((t) => t.symbol === body.symbol);
+      liveMidPx = matched?.lastPx ?? 0;
     }
 
-    if (!Number.isFinite(refPx) || refPx <= 0) {
+    const userLimitPx = Number.parseFloat(body.price || "0");
+    if (body.orderType === "LIMIT" && (!Number.isFinite(userLimitPx) || userLimitPx <= 0)) {
+      return c.json({ ok: false, error: "LIMIT orders require a positive price." }, 400);
+    }
+
+    const effectivePriceForSizing =
+      body.orderType === "LIMIT" ? Math.max(userLimitPx, liveMidPx) : liveMidPx;
+    if (!Number.isFinite(effectivePriceForSizing) || effectivePriceForSizing <= 0) {
       return c.json({ ok: false, error: `Unable to resolve live market reference price for ${body.symbol}.` }, 400);
     }
 
-    const computedNotionalUsd = refPx * qtyNum;
-    const firewall = await runFirewallWithLiveData({
-      marketType: body.marketType,
-      symbol: body.symbol,
-      side: body.side,
-      notionalUsd: computedNotionalUsd,
-      portfolioTotalUsd: body.portfolioTotalUsd,
-      existingAssetUsd: body.existingAssetUsd,
-      maxSlippageBps: body.maxSlippageBps,
-      maxConcentrationPct: body.maxConcentrationPct
-    });
+    const computedNotionalUsd = effectivePriceForSizing * qtyNum;
+    const firewall = await runFirewallWithLiveData(
+      {
+        marketType: body.marketType,
+        symbol: body.symbol,
+        side: body.side,
+        notionalUsd: computedNotionalUsd,
+        portfolioTotalUsd: body.portfolioTotalUsd,
+        existingAssetUsd: body.existingAssetUsd,
+        maxSlippageBps: body.maxSlippageBps,
+        maxConcentrationPct: body.maxConcentrationPct
+      },
+      {
+        network,
+        limitPrice: body.orderType === "LIMIT" ? userLimitPx : undefined
+      }
+    );
 
     const nonce = Date.now();
     const endpoint =
@@ -421,7 +481,7 @@ app.post("/api/v1/execution/prepare", async (c) => {
     const typeNum = body.orderType === "MARKET" ? 2 : 1;
     const tifNum = body.orderType === "MARKET" ? 3 : 1;
 
-    const formattedPrice = body.orderType === "LIMIT" ? roundToStep(refPx, symMeta.tickSize) : undefined;
+    const formattedPrice = body.orderType === "LIMIT" ? roundToStep(userLimitPx, symMeta.tickSize) : undefined;
     const formattedQty = roundToStep(qtyNum, symMeta.stepSize);
 
     const built =
@@ -499,30 +559,93 @@ app.post("/api/v1/execution/submit", async (c) => {
       return c.json({ ok: false, error: "Valid EIP-712 hex signature is required." }, 400);
     }
 
-    // Re-enforce Pre-Trade Risk Firewall server-side prior to broadcasting to SoDEX
-    if (body.symbol && body.notionalUsd && body.notionalUsd > 0) {
-      const fw = await runFirewallWithLiveData({
-        marketType: body.marketType,
-        symbol: body.symbol,
-        side: body.side === "SELL" ? "SELL" : "BUY",
-        notionalUsd: body.notionalUsd,
-        portfolioTotalUsd: body.portfolioTotalUsd,
-        existingAssetUsd: body.existingAssetUsd
-      });
+    const network: SoDexNetwork = body.network === "mainnet" ? "mainnet" : "testnet";
+    const client = new SoDexClient(network === "mainnet" ? SODEX_MAINNET : SODEX_TESTNET);
+    const mainnetClient = new SoDexClient(SODEX_MAINNET);
+
+    // Derive order parameters EXCLUSIVELY from the signed httpBody (never trust client-supplied notionalUsd/symbol!)
+    const rawBody = body.httpBody as {
+      symbolID?: number;
+      orders?: Array<{
+        symbolID?: number;
+        side?: number;
+        type?: number;
+        price?: string;
+        quantity?: string;
+        funds?: string;
+      }>;
+    } | null;
+
+    if (!rawBody || !Array.isArray(rawBody.orders) || rawBody.orders.length === 0) {
+      return c.json({ ok: false, error: "Signed httpBody must contain a non-empty orders array." }, 400);
+    }
+
+    const symbols =
+      body.marketType === "spot"
+        ? await client.getSpotSymbols().catch(() => mainnetClient.getSpotSymbols())
+        : await client.getPerpsSymbols().catch(() => mainnetClient.getPerpsSymbols());
+
+    for (const ord of rawBody.orders) {
+      const symId = body.marketType === "spot" ? ord.symbolID : rawBody.symbolID;
+      const symMeta = symbols.find((s) => s.id === symId);
+      if (!symMeta) {
+        return c.json({ ok: false, error: `Unknown ${body.marketType} symbolID ${String(symId)} inside signed httpBody.` }, 400);
+      }
+
+      const qty = Number.parseFloat(ord.quantity || "0");
+      const funds = Number.parseFloat(ord.funds || "0");
+      const orderPx = Number.parseFloat(ord.price || "0");
+
+      let liveMidPx = 0;
+      const book =
+        (await client.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null)) ??
+        (network === "testnet" ? await mainnetClient.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null) : null);
+      if (book && book.midPrice > 0) {
+        liveMidPx = book.midPrice;
+      } else {
+        const ticks =
+          body.marketType === "spot"
+            ? await client.getSpotTickers().catch(() => mainnetClient.getSpotTickers().catch(() => []))
+            : await client.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers().catch(() => []));
+        liveMidPx = ticks.find((t) => t.symbol === symMeta.name)?.lastPx ?? 0;
+      }
+
+      const marketNotional = qty > 0 && liveMidPx > 0 ? qty * liveMidPx : 0;
+      const limitNotional = qty > 0 && orderPx > 0 ? qty * orderPx : 0;
+      const derivedNotional = Math.max(marketNotional, limitNotional, Number.isFinite(funds) ? funds : 0);
+
+      if (!Number.isFinite(derivedNotional) || derivedNotional <= 0) {
+        return c.json({ ok: false, error: `Unable to derive positive order notional for ${symMeta.name}.` }, 400);
+      }
+
+      const fw = await runFirewallWithLiveData(
+        {
+          marketType: body.marketType,
+          symbol: symMeta.name,
+          side: ord.side === 2 ? "SELL" : "BUY",
+          notionalUsd: derivedNotional,
+          portfolioTotalUsd: body.portfolioTotalUsd,
+          existingAssetUsd: body.existingAssetUsd
+        },
+        {
+          network,
+          limitPrice: ord.type === 1 && orderPx > 0 ? orderPx : undefined
+        }
+      );
+
       if (fw.verdict === "BLOCK") {
         return c.json(
           {
             ok: false,
             blocked: true,
             firewall: fw,
-            error: "Order submission rejected by server-side Pre-Trade Risk Firewall (verdict=BLOCK)."
+            error: `Order submission rejected by server-side Pre-Trade Risk Firewall on ${symMeta.name} (verdict=BLOCK, derived notional $${derivedNotional.toFixed(2)}).`
           },
           403
         );
       }
     }
 
-    const network: SoDexNetwork = body.network === "mainnet" ? "mainnet" : "testnet";
     const endpoint =
       body.marketType === "spot"
         ? `${getSoDexBaseUrl(network)}/api/v1/spot/trade/orders/batch`
@@ -537,11 +660,21 @@ app.post("/api/v1/execution/submit", async (c) => {
     };
     if (body.apiKeyName) headers["X-API-Key"] = body.apiKeyName;
 
-    const res = await fetchJson<unknown>(endpoint, {
+    const res = await fetchJson<{ code?: number; error?: string; message?: string; data?: unknown }>(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(body.httpBody)
     });
+    if (typeof res?.code === "number" && res.code !== 0) {
+      return c.json(
+        {
+          ok: false,
+          error: res.error || res.message || `SoDEX rejected order with code ${res.code}`,
+          data: res
+        },
+        422
+      );
+    }
     return c.json({ ok: true, data: res });
   } catch (err) {
     return c.json({ ok: false, error: err instanceof Error ? err.message : "Order submission failed" }, 502);
@@ -574,6 +707,13 @@ app.post("/mcp", async (c) => {
   try {
     const body = await c.req.json();
     const { key } = resolveSosoKey(c);
+    if (Array.isArray(body)) {
+      const results = (await Promise.all(body.map((item) => handleMcpRequest(item, { sosoApiKey: key })))).filter(
+        (r) => r !== null
+      );
+      if (results.length === 0) return c.body(null, 202);
+      return c.json(results);
+    }
     const res = await handleMcpRequest(body, { sosoApiKey: key });
     if (res === null) {
       return c.body(null, 202);

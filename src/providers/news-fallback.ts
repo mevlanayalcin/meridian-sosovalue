@@ -49,15 +49,16 @@ function parseRssItems(xml: string, sourceLabel: string): PublicNewsItem[] {
   for (const m of itemMatches) {
     const block = m[1];
     const titleRaw = block.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/)?.[1]?.trim() ?? "";
-    const linkRaw = block.match(/<link>([\s\S]*?)<\/link>/)?.[1]?.trim() ?? "";
-    const pubRaw = block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1]?.trim() ?? "";
+    const linkRaw = block.match(/<link>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/link>/)?.[1]?.trim() ?? "";
+    const pubRaw = block.match(/<pubDate>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/pubDate>/)?.[1]?.trim() ?? "";
+    const cleanUrl = linkRaw.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "").trim();
     const title = titleRaw.replace(/&amp;/g, "&").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
-    if (title && linkRaw) {
+    if (title && /^https?:\/\//i.test(cleanUrl)) {
       items.push({
         id: `rss-${items.length}-${pubRaw.slice(0, 16)}`,
         title,
         source: sourceLabel,
-        url: linkRaw,
+        url: cleanUrl,
         publishedAt: pubRaw ? new Date(pubRaw).toISOString() : new Date().toISOString(),
         sentiment: classifyHeadlineSentiment(title),
         tags: ["Crypto", "Market"],

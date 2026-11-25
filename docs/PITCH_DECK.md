@@ -36,6 +36,6 @@ Running a financial news agency, index publisher, and asset manager normally req
 ## Slide 5 — Judging Rubric Alignment
 - **User Value (30%)**: Single operator runs scheduled research, custom index publishing, fail-closed risk gating, and agent distribution from one terminal.
 - **Working Demo (25%)**: Always-on global edge HTTPS deployment with live data, zero mocks, and BYOK SoSoValue OpenAPI support.
-- **Logic & Risk Control (20%)**: Deterministic fail-closed Pre-Trade Firewall + SHA-256 thesis/audit ledger + walk-forward backtester + 16 regression tests.
+- **Logic & Risk Control (20%)**: Deterministic fail-closed Pre-Trade Firewall (15% price collar, live `HALT` checks, signed `httpBody` re-verification) + SHA-256 thesis/audit ledger + periodic-rebalanced backtester + 19 regression tests.
 - **Data Integration (15%)**: SoSoValue OpenAPI (ETF/News macro overlay) + SoDEX Spot/Perps/Wealth + ValueChain JSON-RPC + Base SSI `eth_call`.
 - **UX & Clarity (10%)**: 5-step guided institutional terminal with real-time L2 depth ladder, editable risk limits, and interactive equity curve.

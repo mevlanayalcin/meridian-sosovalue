@@ -40,20 +40,21 @@ export interface PerpsOrderSpec {
 
 /**
  * Rounds a positive decimal number to exact symbol tickSize / stepSize precision
- * without collapsing sub-cent tokens (e.g. PEPE 0.0000084) to "0.0000".
+ * and strips trailing fractional zeros as required by SoDEX API authentication rules.
  */
 export function roundToStep(value: number, stepStr?: string, fallbackDecimals = 4): string {
   if (!Number.isFinite(value) || value <= 0) return "0";
+  const stripTrailingZeros = (s: string) => s.replace(/(\.\d*?[1-9])0+$/, "$1").replace(/\.0+$/, "");
   const step = stepStr ? Number.parseFloat(stepStr) : Number.NaN;
   if (Number.isFinite(step) && step > 0) {
     const match = stepStr!.trim().match(/\.(\d+)/);
     const decimals = match ? match[1].replace(/0+$/, "").length : 0;
     const snapped = Math.round(value / step) * step;
     const safe = snapped > 0 ? snapped : step;
-    return safe.toFixed(decimals);
+    return stripTrailingZeros(safe.toFixed(decimals));
   }
   const autoDecimals = value < 0.001 ? 8 : value < 1 ? 6 : fallbackDecimals;
-  return value.toFixed(autoDecimals).replace(/\.?0+$/, "");
+  return stripTrailingZeros(value.toFixed(autoDecimals));
 }
 
 /**
