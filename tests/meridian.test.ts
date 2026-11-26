@@ -235,6 +235,9 @@ describe("On-Chain 8-Decimal SSI Supply, APY Sanitizer & SoSoValue Client", () =
     expect(hasHallucinatedPercentage("Extreme 215214% yield")).toBe(true);
     expect(hasHallucinatedPercentage("Spaced 61338 % outlier")).toBe(true);
     expect(hasHallucinatedPercentage("Written out 61338 percent yield")).toBe(true);
+    expect(hasHallucinatedPercentage("British 61338 per cent yield")).toBe(true);
+    expect(hasHallucinatedPercentage("Abbreviated 61338 pct yield")).toBe(true);
+    expect(hasHallucinatedPercentage("Fullwidth 61338％ yield")).toBe(true);
     expect(hasHallucinatedPercentage("Morpho-Earn carries 8.42% APY")).toBe(false);
     expect(hasHallucinatedPercentage("BTC-USD Perp funding rate is 0.0013% (-0.0009% 8h)")).toBe(false);
   });
@@ -256,8 +259,10 @@ describe("On-Chain 8-Decimal SSI Supply, APY Sanitizer & SoSoValue Client", () =
     ]);
   });
 
-  it("classifies exchange breach and security incident headlines as BEARISH", () => {
+  it("classifies exchange breach, crash, and security incident headlines as BEARISH", () => {
     expect(classifyHeadlineSentiment("Bithumb data breach exposes customer records")).toBe("BEARISH");
+    expect(classifyHeadlineSentiment("Market crashes as leverage unwinds")).toBe("BEARISH");
+    expect(classifyHeadlineSentiment("Hackers steal $100M from DeFi bridge")).toBe("BEARISH");
     expect(classifyHeadlineSentiment("Record exchange hack drains $40M in hot wallet funds")).toBe("BEARISH");
     expect(classifyHeadlineSentiment("Spot Bitcoin ETF sees $450M institutional inflow")).toBe("BULLISH");
   });

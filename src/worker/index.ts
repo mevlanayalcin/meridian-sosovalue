@@ -7,7 +7,7 @@ import { SoDexClient, SODEX_MAINNET, SODEX_TESTNET } from "../providers/sodex";
 import { fetchJson, sha256Hex } from "../providers/http";
 import { runFirewallWithLiveData } from "../engine/live-firewall";
 import { runBasketBacktest } from "../engine/quant";
-import { generateGroundedThesis } from "../engine/ai-analyst";
+import { computeThesisDigest, generateGroundedThesis } from "../engine/ai-analyst";
 import {
   buildMetaMaskTypedDataV4,
   buildPerpsOrderPayload,
@@ -187,6 +187,9 @@ app.get("/api/v1/firewall/audits", async (c) => {
 });
 
 app.post("/api/v1/backtest", async (c) => {
+  if (!checkRateLimit("backtest", getClientIp(c), 25)) {
+    return c.json({ ok: false, error: "Rate limit exceeded on backtest requests. Please retry in 60 seconds." }, 429);
+  }
   try {
     const body = (await c.req.json()) as {
       basketName?: string;
@@ -307,6 +310,57 @@ async function persistThesis(db: D1Database | undefined, thesis: PublishedThesis
     .catch(() => undefined);
 }
 
+/**
+ * Shared thesis synthesis + target-asset Pre-Trade Risk Firewall binding + final SHA-256 digest computation.
+ * Used identically by POST /api/v1/theses/generate and the 6h Cloudflare Cron scheduled() trigger
+ * so firewallVerdict always checks the ACTUAL thesis targetAsset and sha256Digest covers the final persisted record.
+ */
+async function generateAndVerifyThesis(
+  bundle: Awaited<ReturnType<typeof buildMarketOverview>>,
+  focus: string,
+  nvidiaApiKey?: string
+): Promise<PublishedThesis> {
+  const draftThesis = await generateGroundedThesis(bundle, focus, nvidiaApiKey, null);
+
+  const leadSymbol = draftThesis.targetAsset || "vMAG7ssi_vUSDC";
+  const isWealthLead = bundle.wealthFunds.some((w) => w.fundId === leadSymbol);
+  const isPerpsLead = !isWealthLead && bundle.perpsTickers.some((p) => p.symbol === leadSymbol);
+  const liveFw = await runFirewallWithLiveData({
+    marketType: isWealthLead ? "wealth" : isPerpsLead ? "perps" : "spot",
+    symbol: leadSymbol,
+    side: "BUY",
+    notionalUsd: 1000,
+    portfolioTotalUsd: 10_000
+  }).catch(() => null);
+
+  if (!liveFw) return draftThesis;
+
+  const finalWithoutDigest: Omit<PublishedThesis, "sha256Digest"> = {
+    id: draftThesis.id,
+    createdAt: draftThesis.createdAt,
+    title: draftThesis.title,
+    regime: draftThesis.regime,
+    confidence: draftThesis.confidence,
+    conviction: draftThesis.conviction,
+    targetAsset: draftThesis.targetAsset,
+    direction: draftThesis.direction,
+    summary: draftThesis.summary,
+    allocation: draftThesis.allocation,
+    firewallVerdict: liveFw.verdict,
+    aiModel: draftThesis.aiModel,
+    evidence: [
+      ...draftThesis.evidence,
+      {
+        metric: `Pre-Trade Risk Firewall (${liveFw.symbol})`,
+        value: `${liveFw.verdict} (risk ${liveFw.riskScore}/100, slip ${liveFw.slippageBps.toFixed(1)} bps, spread ${liveFw.spreadBps.toFixed(1)} bps)`,
+        source: liveFw.source
+      }
+    ]
+  };
+  const sha256Digest = await computeThesisDigest(finalWithoutDigest);
+  return { ...finalWithoutDigest, sha256Digest };
+}
+
 app.post("/api/v1/theses/generate", async (c) => {
   if (!checkRateLimit("theses", getClientIp(c), 12)) {
     return c.json({ ok: false, error: "Rate limit exceeded on AI thesis generation. Please retry in 60 seconds." }, 429);
@@ -320,39 +374,11 @@ app.post("/api/v1/theses/generate", async (c) => {
       tavilyApiKey: c.env?.TAVILY_API_KEY
     });
 
-    const draftThesis: PublishedThesis = await generateGroundedThesis(
+    const thesis = await generateAndVerifyThesis(
       bundle,
       body.focus?.trim() || "Cross-asset SSI Index & RWA Capital Allocation",
-      c.env?.NVIDIA_API_KEY,
-      null
+      c.env?.NVIDIA_API_KEY
     );
-
-    // Run real Pre-Trade Risk Firewall on the thesis's ACTUAL lead target asset
-    const leadSymbol = draftThesis.targetAsset || "vMAG7ssi_vUSDC";
-    const isWealthLead = bundle.wealthFunds.some((w) => w.fundId === leadSymbol);
-    const isPerpsLead = !isWealthLead && bundle.perpsTickers.some((p) => p.symbol === leadSymbol);
-    const liveFw = await runFirewallWithLiveData({
-      marketType: isWealthLead ? "wealth" : isPerpsLead ? "perps" : "spot",
-      symbol: leadSymbol,
-      side: "BUY",
-      notionalUsd: 1000,
-      portfolioTotalUsd: 10_000
-    }).catch(() => null);
-
-    const thesis: PublishedThesis = liveFw
-      ? {
-          ...draftThesis,
-          firewallVerdict: liveFw.verdict,
-          evidence: [
-            ...draftThesis.evidence,
-            {
-              metric: `Pre-Trade Risk Firewall (${liveFw.symbol})`,
-              value: `${liveFw.verdict} (risk ${liveFw.riskScore}/100, slip ${liveFw.slippageBps.toFixed(1)} bps, spread ${liveFw.spreadBps.toFixed(1)} bps)`,
-              source: liveFw.source
-            }
-          ]
-        }
-      : draftThesis;
 
     await persistThesis(c.env?.DB, thesis);
     return c.json({ ok: true, data: thesis });
@@ -362,6 +388,9 @@ app.post("/api/v1/theses/generate", async (c) => {
 });
 
 app.post("/api/v1/execution/prepare", async (c) => {
+  if (!checkRateLimit("prepare", getClientIp(c), 40)) {
+    return c.json({ ok: false, error: "Rate limit exceeded on execution preparation. Please retry in 60 seconds." }, 429);
+  }
   try {
     const body = (await c.req.json()) as {
       network: SoDexNetwork;
@@ -760,6 +789,12 @@ app.get("/api/v1/openapi.json", (c) =>
 );
 
 app.post("/mcp", async (c) => {
+  if (!checkRateLimit("mcp", getClientIp(c), 60)) {
+    return c.json(
+      { jsonrpc: "2.0", id: null, error: { code: -32000, message: "Rate limit exceeded on MCP endpoint. Retry in 60s." } },
+      429
+    );
+  }
   try {
     const body = await c.req.json();
     const { key } = resolveSosoKey(c);
@@ -795,19 +830,10 @@ export default {
       keyOrigin: env.SOSOVALUE_API_KEY ? "server_env" : "none",
       tavilyApiKey: env.TAVILY_API_KEY
     });
-    const leadSymbol = bundle.spotTickers.find((s) => s.symbol === "vMAG7ssi_vUSDC")?.symbol ?? "vMAG7ssi_vUSDC";
-    const liveFw = await runFirewallWithLiveData({
-      marketType: "spot",
-      symbol: leadSymbol,
-      side: "BUY",
-      notionalUsd: 1000,
-      portfolioTotalUsd: 10_000
-    }).catch(() => null);
-    const thesis = await generateGroundedThesis(
+    const thesis = await generateAndVerifyThesis(
       bundle,
       "Scheduled 6h Autonomous Cross-Asset Regime & SSI Parity Brief",
-      env.NVIDIA_API_KEY,
-      liveFw
+      env.NVIDIA_API_KEY
     );
     await persistThesis(env.DB, thesis);
   }

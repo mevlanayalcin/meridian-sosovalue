@@ -17,9 +17,9 @@ export function sanitizeVaultApy(apy: number | null): number | null {
 }
 
 export function hasHallucinatedPercentage(text: string): boolean {
-  // Flags >=1,000% (with or without commas, spaces, decimals, or "percent"), while NEVER flagging
-  // tiny decimal percentages such as funding rates ("0.0013%", "-0.0009%").
-  const regex = /(?:^|[^\d.])(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?\s*(?:%|percent\b)/gi;
+  // Flags >=1,000% (with or without commas, spaces, decimals, "%", "％", "percent", "per cent", or "pct"),
+  // while NEVER flagging tiny decimal percentages such as funding rates ("0.0013%", "-0.0009%").
+  const regex = /(?:^|[^\d.])(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?\s*(?:%|％|percent\b|per\s+cent\b|pct\b)/gi;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
     const numeric = Number.parseFloat(match[1].replace(/,/g, ""));
@@ -28,6 +28,26 @@ export function hasHallucinatedPercentage(text: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Deterministic SHA-256 thesis content digest over the FINAL thesis fields (including bound firewallVerdict & evidence).
+ */
+export async function computeThesisDigest(thesis: Omit<PublishedThesis, "sha256Digest">): Promise<string> {
+  return sha256Hex(
+    JSON.stringify({
+      id: thesis.id,
+      createdAt: thesis.createdAt,
+      title: thesis.title,
+      direction: thesis.direction,
+      conviction: thesis.conviction,
+      targetAsset: thesis.targetAsset,
+      summary: thesis.summary,
+      allocation: thesis.allocation,
+      evidence: thesis.evidence,
+      firewallVerdict: thesis.firewallVerdict
+    })
+  );
 }
 
 /**
@@ -196,8 +216,9 @@ export async function generateGroundedThesis(
       const jsonMatch = raw.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]) as Partial<PublishedThesis>;
+        const titleStr = String(parsed.title ?? "");
         const summaryStr = String(parsed.summary ?? "");
-        if (parsed.title && parsed.summary && !hasHallucinatedPercentage(summaryStr)) {
+        if (titleStr && summaryStr && !hasHallucinatedPercentage(titleStr) && !hasHallucinatedPercentage(summaryStr)) {
           title = String(parsed.title).slice(0, 90);
           summary = summaryStr.slice(0, 600);
           if (
@@ -251,20 +272,7 @@ export async function generateGroundedThesis(
   }
 
   const id = `th_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
-  const bodyForHash = JSON.stringify({
-    id,
-    now,
-    title,
-    direction,
-    conviction,
-    summary,
-    parsedAllocation,
-    defaultEvidence,
-    firewallVerdict
-  });
-  const sha256Digest = await sha256Hex(bodyForHash);
-
-  return {
+  const unsignedThesis: Omit<PublishedThesis, "sha256Digest"> = {
     id,
     createdAt: now,
     title,
@@ -277,7 +285,12 @@ export async function generateGroundedThesis(
     evidence: defaultEvidence,
     allocation: parsedAllocation,
     firewallVerdict,
-    sha256Digest,
     aiModel
+  };
+  const sha256Digest = await computeThesisDigest(unsignedThesis);
+
+  return {
+    ...unsignedThesis,
+    sha256Digest
   };
 }

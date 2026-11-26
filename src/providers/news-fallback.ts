@@ -12,9 +12,9 @@ export interface PublicNewsItem {
   provenance: ProvenanceSource;
 }
 
-const BULL_WORDS = /\b(surge|rally|inflow|approve|adoption|record|launch|partner|growth|breakout|gain|soar|etf)\b/i;
-const SEVERE_BEAR_WORDS = /\b(breach|hack|hacked|exploit|exploited|stolen|drained|phishing|bankrupt|bankruptcy|insolvency|rugpull|fraud|outage)\b/i;
-const BEAR_WORDS = /\b(breach|hack|hacked|exploit|exploited|stolen|drained|phishing|bankrupt|bankruptcy|insolvency|outage|halted|fraud|outflow|drop|crash|lawsuit|ban|decline|liquidation|sec|warning|selloff|slump|fine|penalty|investigation)\b/i;
+const BULL_WORDS = /\b(surge|surges|rally|rallies|inflow|inflows|approve|approved|adoption|record|launch|launches|partner|growth|breakout|gain|gains|soar|soars|etf)\b/i;
+const SEVERE_BEAR_WORDS = /\b(breach|breaches|hack|hacks|hacked|hacker|hackers|exploit|exploits|exploited|steal|steals|stolen|drain|drains|drained|phishing|bankrupt|bankruptcy|insolvency|rugpull|fraud|outage)\b/i;
+const BEAR_WORDS = /\b(breach|breaches|hack|hacks|hacked|hacker|hackers|exploit|exploits|exploited|steal|steals|stolen|drain|drains|drained|phishing|bankrupt|bankruptcy|insolvency|outage|halted|fraud|outflow|outflows|drop|drops|crash|crashes|crashing|plunge|plunges|tumble|tumbles|collapse|collapses|lawsuit|ban|bans|decline|declines|liquidation|liquidations|sec|warning|selloff|slump|slumps|fine|penalty|investigation)\b/i;
 
 export function classifyHeadlineSentiment(title: string): "BULLISH" | "BEARISH" | "NEUTRAL" {
   // Severe security/insolvency events override generic bullish words (e.g. "record breach")
