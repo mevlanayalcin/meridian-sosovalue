@@ -5,7 +5,7 @@ import { buildMarketOverview } from "./overview";
 import { handleMcpRequest } from "./mcp";
 import { SoDexClient, SODEX_MAINNET, SODEX_TESTNET } from "../providers/sodex";
 import { fetchJson, sha256Hex } from "../providers/http";
-import { evaluateTradeFirewall } from "../engine/firewall";
+import { runFirewallWithLiveData } from "../engine/live-firewall";
 import { runBasketBacktest } from "../engine/quant";
 import { generateGroundedThesis } from "../engine/ai-analyst";
 import {
@@ -18,7 +18,7 @@ import {
   signExchangeActionWithKey,
   type SoDexNetwork
 } from "../engine/sodex-eip712";
-import type { BasketLeg, FirewallCheckRequest, FirewallCheckResult, PublishedThesis } from "../shared/types";
+import type { BasketLeg, FirewallCheckRequest, PublishedThesis } from "../shared/types";
 
 export interface Env {
   ASSETS?: { fetch: (req: Request) => Promise<Response> };
@@ -28,8 +28,72 @@ export interface Env {
   TAVILY_API_KEY?: string;
 }
 
+const ALLOWED_MUTATION_ORIGINS = new Set([
+  "https://meridian.bedir-ai.workers.dev",
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:8787",
+  "http://127.0.0.1:8787"
+]);
+
+const RATE_WINDOW_MS = 60_000;
+const rateBuckets = new Map<string, number[]>();
+
+function checkRateLimit(bucket: string, ip: string, maxPerMin: number): boolean {
+  if (!ip) return true;
+  const key = `${bucket}:${ip}`;
+  const now = Date.now();
+  const prev = (rateBuckets.get(key) ?? []).filter((ts) => now - ts < RATE_WINDOW_MS);
+  if (prev.length >= maxPerMin) {
+    rateBuckets.set(key, prev);
+    return false;
+  }
+  prev.push(now);
+  rateBuckets.set(key, prev);
+  if (rateBuckets.size > 1000) rateBuckets.clear();
+  return true;
+}
+
+function getClientIp(c: { req: { header: (k: string) => string | undefined } }): string {
+  return c.req.header("cf-connecting-ip") ?? c.req.header("x-forwarded-for")?.split(",")[0]?.trim() ?? "";
+}
+
 const app = new Hono<{ Bindings: Env }>();
-app.use("*", cors());
+
+// Strict security headers on all responses (HTML, assets, REST API, MCP)
+app.use("*", async (c, next) => {
+  await next();
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("Referrer-Policy", "no-referrer");
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  c.header(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+  );
+});
+
+// Public read endpoints & /mcp allow cross-origin agent access; state-mutating / paid-key POSTs restrict browser Origin
+app.use(
+  "/api/*",
+  cors({
+    origin: (origin, c) => {
+      if (!origin) return "";
+      if (c.req.method === "GET" || c.req.method === "HEAD") return origin;
+      return ALLOWED_MUTATION_ORIGINS.has(origin) ? origin : "";
+    },
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "X-Soso-Api-Key"]
+  })
+);
+app.use(
+  "/mcp",
+  cors({
+    origin: "*",
+    allowMethods: ["POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "X-Soso-Api-Key"]
+  })
+);
 
 function resolveSosoKey(c: { req: { header: (k: string) => string | undefined }; env?: Env }) {
   const hdr = c.req.header("x-soso-api-key")?.trim();
@@ -75,75 +139,10 @@ app.get("/api/v1/orderbook/:marketType/:symbol", async (c) => {
   }
 });
 
-async function runFirewallWithLiveData(
-  req: FirewallCheckRequest,
-  opts?: { network?: SoDexNetwork; limitPrice?: number }
-): Promise<FirewallCheckResult> {
-  const network: SoDexNetwork = opts?.network === "testnet" ? "testnet" : "mainnet";
-  const netClient = new SoDexClient(network === "mainnet" ? SODEX_MAINNET : SODEX_TESTNET);
-  const mainnetClient = new SoDexClient(SODEX_MAINNET);
-
-  const book =
-    req.marketType === "wealth"
-      ? null
-      : (await netClient.getOrderbook(req.marketType, req.symbol, 50).catch(() => null)) ??
-        (network === "testnet" ? await mainnetClient.getOrderbook(req.marketType, req.symbol, 50).catch(() => null) : null);
-
-  let refPx = book?.midPrice ?? 0;
-  let intradayVolPct = 3.2;
-  let channelStatus = "clob";
-  let assetFound = true;
-
-  if (req.marketType === "wealth") {
-    const funds = await mainnetClient.getWealthFunds();
-    const f = funds.find((x) => x.fundId === req.symbol);
-    assetFound = Boolean(f);
-    refPx = f?.price ?? 0;
-    channelStatus = f?.channel ?? "not_found";
-    intradayVolPct = f?.fundType === "bridged_vault" ? 0.5 : 4.5;
-  } else if (req.marketType === "spot") {
-    const [tickers, symbols] = await Promise.all([
-      netClient.getSpotTickers().catch(() => mainnetClient.getSpotTickers()),
-      netClient.getSpotSymbols().catch(() => mainnetClient.getSpotSymbols())
-    ]);
-    const t = tickers.find((x) => x.symbol === req.symbol);
-    const symMeta = symbols.find((s) => s.name === req.symbol);
-    assetFound = Boolean(symMeta || t || book);
-    if (symMeta?.status) {
-      channelStatus = symMeta.status;
-    }
-    if (t && t.lastPx > 0) {
-      refPx = t.lastPx;
-      intradayVolPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
-    }
-  } else {
-    const [tickers, symbols] = await Promise.all([
-      netClient.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers()),
-      netClient.getPerpsSymbols().catch(() => mainnetClient.getPerpsSymbols())
-    ]);
-    const t = tickers.find((x) => x.symbol === req.symbol);
-    const symMeta = symbols.find((s) => s.name === req.symbol);
-    assetFound = Boolean(symMeta || t || book);
-    if (symMeta?.status) {
-      channelStatus = symMeta.status;
-    }
-    if (t && t.lastPx > 0) {
-      refPx = t.lastPx;
-      intradayVolPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
-    }
-  }
-
-  return evaluateTradeFirewall(req, {
-    orderbook: book,
-    intradayVolPct,
-    venueChannelStatus: channelStatus,
-    referencePrice: refPx,
-    assetFound,
-    limitPrice: opts?.limitPrice
-  });
-}
-
 app.post("/api/v1/firewall/check", async (c) => {
+  if (!checkRateLimit("firewall", getClientIp(c), 40)) {
+    return c.json({ ok: false, error: "Rate limit exceeded on firewall checks. Please retry shortly." }, 429);
+  }
   try {
     const body = (await c.req.json()) as FirewallCheckRequest;
     const result = await runFirewallWithLiveData(body);
@@ -309,6 +308,9 @@ async function persistThesis(db: D1Database | undefined, thesis: PublishedThesis
 }
 
 app.post("/api/v1/theses/generate", async (c) => {
+  if (!checkRateLimit("theses", getClientIp(c), 12)) {
+    return c.json({ ok: false, error: "Rate limit exceeded on AI thesis generation. Please retry in 60 seconds." }, 429);
+  }
   try {
     const body = (await c.req.json().catch(() => ({}))) as { focus?: string };
     const { key, origin } = resolveSosoKey(c);
@@ -540,6 +542,9 @@ app.post("/api/v1/execution/prepare", async (c) => {
 });
 
 app.post("/api/v1/execution/submit", async (c) => {
+  if (!checkRateLimit("submit", getClientIp(c), 15)) {
+    return c.json({ ok: false, error: "Rate limit exceeded on order relay. Please retry in 60 seconds." }, 429);
+  }
   try {
     const body = (await c.req.json()) as {
       network: SoDexNetwork;
@@ -579,11 +584,30 @@ app.post("/api/v1/execution/submit", async (c) => {
     if (!rawBody || !Array.isArray(rawBody.orders) || rawBody.orders.length === 0) {
       return c.json({ ok: false, error: "Signed httpBody must contain a non-empty orders array." }, 400);
     }
+    if (rawBody.orders.length > 500) {
+      return c.json({ ok: false, error: `Batch exceeds hard maximum 500 orders (got ${rawBody.orders.length}).` }, 400);
+    }
 
     const symbols =
       body.marketType === "spot"
         ? await client.getSpotSymbols().catch(() => mainnetClient.getSpotSymbols())
         : await client.getPerpsSymbols().catch(() => mainnetClient.getPerpsSymbols());
+
+    // Resolve live mid price once per unique symbol and aggregate all orders per (symbol, side)
+    // in a single pass so both single-order off-market collars AND split batches (e.g. 20 x 2.5 or 100 x 0.5 vBTC)
+    // are checked in constant upstream subrequests without exhausting Worker subrequest budgets.
+    const midPxCache = new Map<string, number>();
+    const aggregateBuckets = new Map<
+      string,
+      {
+        symbol: string;
+        side: "BUY" | "SELL";
+        totalNotional: number;
+        count: number;
+        worstLimitPrice?: number;
+        worstLimitDevPct: number;
+      }
+    >();
 
     for (const ord of rawBody.orders) {
       const symId = body.marketType === "spot" ? ord.symbolID : rawBody.symbolID;
@@ -596,18 +620,21 @@ app.post("/api/v1/execution/submit", async (c) => {
       const funds = Number.parseFloat(ord.funds || "0");
       const orderPx = Number.parseFloat(ord.price || "0");
 
-      let liveMidPx = 0;
-      const book =
-        (await client.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null)) ??
-        (network === "testnet" ? await mainnetClient.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null) : null);
-      if (book && book.midPrice > 0) {
-        liveMidPx = book.midPrice;
-      } else {
-        const ticks =
-          body.marketType === "spot"
-            ? await client.getSpotTickers().catch(() => mainnetClient.getSpotTickers().catch(() => []))
-            : await client.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers().catch(() => []));
-        liveMidPx = ticks.find((t) => t.symbol === symMeta.name)?.lastPx ?? 0;
+      let liveMidPx = midPxCache.get(symMeta.name) ?? 0;
+      if (liveMidPx <= 0) {
+        const book =
+          (await client.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null)) ??
+          (network === "testnet" ? await mainnetClient.getOrderbook(body.marketType, symMeta.name, 20).catch(() => null) : null);
+        if (book && book.midPrice > 0) {
+          liveMidPx = book.midPrice;
+        } else {
+          const ticks =
+            body.marketType === "spot"
+              ? await client.getSpotTickers().catch(() => mainnetClient.getSpotTickers().catch(() => []))
+              : await client.getPerpsTickers().catch(() => mainnetClient.getPerpsTickers().catch(() => []));
+          liveMidPx = ticks.find((t) => t.symbol === symMeta.name)?.lastPx ?? 0;
+        }
+        if (liveMidPx > 0) midPxCache.set(symMeta.name, liveMidPx);
       }
 
       const marketNotional = qty > 0 && liveMidPx > 0 ? qty * liveMidPx : 0;
@@ -618,28 +645,57 @@ app.post("/api/v1/execution/submit", async (c) => {
         return c.json({ ok: false, error: `Unable to derive positive order notional for ${symMeta.name}.` }, 400);
       }
 
+      const side: "BUY" | "SELL" = ord.side === 2 ? "SELL" : "BUY";
+      const bucketKey = `${symMeta.name}:${side}`;
+      const limitPx = ord.type === 1 && orderPx > 0 ? orderPx : undefined;
+      const devPct = limitPx !== undefined && liveMidPx > 0 ? (Math.abs(limitPx - liveMidPx) / liveMidPx) * 100 : -1;
+
+      const prevBucket = aggregateBuckets.get(bucketKey);
+      if (prevBucket) {
+        prevBucket.totalNotional += derivedNotional;
+        prevBucket.count += 1;
+        if (limitPx !== undefined && devPct > prevBucket.worstLimitDevPct) {
+          prevBucket.worstLimitPrice = limitPx;
+          prevBucket.worstLimitDevPct = devPct;
+        }
+      } else {
+        aggregateBuckets.set(bucketKey, {
+          symbol: symMeta.name,
+          side,
+          totalNotional: derivedNotional,
+          count: 1,
+          worstLimitPrice: limitPx,
+          worstLimitDevPct: devPct
+        });
+      }
+    }
+
+    // Evaluate each aggregated (symbol, side) exposure through the live Pre-Trade Risk Firewall
+    for (const bucket of aggregateBuckets.values()) {
       const fw = await runFirewallWithLiveData(
         {
           marketType: body.marketType,
-          symbol: symMeta.name,
-          side: ord.side === 2 ? "SELL" : "BUY",
-          notionalUsd: derivedNotional,
+          symbol: bucket.symbol,
+          side: bucket.side,
+          notionalUsd: bucket.totalNotional,
           portfolioTotalUsd: body.portfolioTotalUsd,
           existingAssetUsd: body.existingAssetUsd
         },
         {
           network,
-          limitPrice: ord.type === 1 && orderPx > 0 ? orderPx : undefined
+          limitPrice: bucket.worstLimitPrice
         }
       );
-
       if (fw.verdict === "BLOCK") {
         return c.json(
           {
             ok: false,
             blocked: true,
             firewall: fw,
-            error: `Order submission rejected by server-side Pre-Trade Risk Firewall on ${symMeta.name} (verdict=BLOCK, derived notional $${derivedNotional.toFixed(2)}).`
+            error:
+              bucket.count > 1
+                ? `Batch submission rejected by aggregate Pre-Trade Risk Firewall on ${bucket.symbol} (${bucket.count} split ${bucket.side} orders totaling $${bucket.totalNotional.toFixed(2)}, verdict=BLOCK).`
+                : `Order submission rejected by server-side Pre-Trade Risk Firewall on ${bucket.symbol} (verdict=BLOCK, derived notional $${bucket.totalNotional.toFixed(2)}).`
           },
           403
         );

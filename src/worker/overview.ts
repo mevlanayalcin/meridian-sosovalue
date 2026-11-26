@@ -1,5 +1,5 @@
 import { SoDexClient } from "../providers/sodex";
-import { SoSoValueClient } from "../providers/sosovalue";
+import { parseFomcNextProbabilities, SoSoValueClient } from "../providers/sosovalue";
 import { computeSsiParity, getValueChainBlocks } from "../providers/onchain";
 import { classifyHeadlineSentiment, fetchPublicNews } from "../providers/news-fallback";
 import { detectMarketRegime } from "../engine/quant";
@@ -45,6 +45,7 @@ export async function buildMarketOverview(opts: {
     etfLatestDate: null,
     btcDominancePct: null,
     totalMarketCapUsd: null,
+    fomcNextMeetingDate: null,
     fomcNextProbabilities: [],
     indicesCount: 0
   };
@@ -60,7 +61,7 @@ export async function buildMarketOverview(opts: {
         soso.getFomcProbabilities().catch(() => null)
       ]);
 
-      sosoOpenApi.connected = Boolean(overview || etfHist.length || indices.length);
+      sosoOpenApi.connected = Boolean(overview || etfHist.length || indices.length || fomc);
       if (sosoOpenApi.connected) provenanceSet.add("SoSoValue OpenAPI v1/v3");
 
       if (overview) {
@@ -74,12 +75,9 @@ export async function buildMarketOverview(opts: {
       }
       sosoOpenApi.indicesCount = indices.length;
 
-      if (fomc?.meetings?.[0]?.probabilities) {
-        sosoOpenApi.fomcNextProbabilities = fomc.meetings[0].probabilities.map((p) => ({
-          rateRange: p.rate_range,
-          probabilityPct: Number((p.probability * 100).toFixed(1))
-        }));
-      }
+      const parsedFomc = parseFomcNextProbabilities(fomc);
+      sosoOpenApi.fomcNextMeetingDate = parsedFomc.meetingDate;
+      sosoOpenApi.fomcNextProbabilities = parsedFomc.probabilities;
 
       if (sosoNews.list?.length) {
         newsFeed = sosoNews.list.map((n) => {
@@ -108,15 +106,21 @@ export async function buildMarketOverview(opts: {
     }
   }
 
-  // Feed SoSoValue ETF flows and news sentiment directly into market regime classification
+  // Feed SoSoValue ETF flows, FOMC pricing, and news sentiment directly into market regime classification
   const sentimentNumeric: number[] = newsFeed.map((n) => (n.sentiment === "BULLISH" ? 1 : n.sentiment === "BEARISH" ? -1 : 0));
   const newsSentimentScore = sentimentNumeric.length
     ? sentimentNumeric.reduce((a, b) => a + b, 0) / sentimentNumeric.length
     : null;
 
+  const topFomc = [...sosoOpenApi.fomcNextProbabilities].sort((a, b) => b.probabilityPct - a.probabilityPct)[0];
+  const fomcHoldOrCutBias = topFomc
+    ? `${topFomc.rateRange} bps (${topFomc.probabilityPct.toFixed(1)}%${sosoOpenApi.fomcNextMeetingDate ? `, ${sosoOpenApi.fomcNextMeetingDate}` : ""})`
+    : null;
+
   const regime = detectMarketRegime(spotTickers, perpsTickers, wealthFunds, {
     etfNetInflowUsd: sosoOpenApi.etfNetInflowUsd,
-    newsSentimentScore
+    newsSentimentScore,
+    fomcHoldOrCutBias
   });
 
   return {

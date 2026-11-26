@@ -540,7 +540,14 @@ export default function App() {
                 </div>
                 <div className="mt-1 text-xs text-slate-400">
                   {overview?.sosoOpenApi.connected
-                    ? `Settled ${overview.sosoOpenApi.etfLatestDate}`
+                    ? (() => {
+                        const topFomc = [...(overview.sosoOpenApi.fomcNextProbabilities ?? [])].sort(
+                          (a, b) => b.probabilityPct - a.probabilityPct
+                        )[0];
+                        return topFomc
+                          ? `Settled ${overview.sosoOpenApi.etfLatestDate} · FOMC ${topFomc.rateRange}bps (${topFomc.probabilityPct}%)`
+                          : `Settled ${overview.sosoOpenApi.etfLatestDate}`;
+                      })()
                     : `Testnet #${(overview?.valueChainTestnetBlock ?? 0).toLocaleString("en-US")}`}
                 </div>
               </div>
@@ -907,8 +914,21 @@ export default function App() {
                       <td className="py-2 text-slate-300">{f.fundType}</td>
                       <td className="py-2 text-right text-cyan-300">${f.price.toFixed(4)}</td>
                       <td className="py-2 text-right">{f.aum !== null ? fmtUsd(f.aum, 0) : "CLOB/Bridged"}</td>
-                      <td className={`py-2 text-right ${(f.apy7d ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                        {f.apy7d !== null ? `${f.apy7d.toFixed(2)}%` : "—"}
+                      <td className="py-2 text-right">
+                        {f.apy7d === null ? (
+                          <span className="text-slate-500">—</span>
+                        ) : f.apy7d < -25 || f.apy7d > 40 ? (
+                          <span
+                            title="Raw 7d annualized swing outside [-25%, 40%] yield sanity filter; excluded from avgRwaApyPct & LLM prompts"
+                            className="px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 text-[10px]"
+                          >
+                            Outlier (excl.)
+                          </span>
+                        ) : (
+                          <span className={f.apy7d >= 0 ? "text-emerald-400" : "text-rose-400"}>
+                            {f.apy7d.toFixed(2)}%
+                          </span>
+                        )}
                       </td>
                       <td className={`py-2 text-right ${(f.roi1M ?? 0) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
                         {f.roi1M !== null ? `${f.roi1M.toFixed(2)}%` : "—"}

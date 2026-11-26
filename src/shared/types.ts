@@ -207,6 +207,7 @@ export interface MarketOverviewBundle {
     etfLatestDate: string | null;
     btcDominancePct: number | null;
     totalMarketCapUsd: number | null;
+    fomcNextMeetingDate: string | null;
     fomcNextProbabilities: Array<{ rateRange: string; probabilityPct: number }>;
     indicesCount: number;
     errorNote?: string;

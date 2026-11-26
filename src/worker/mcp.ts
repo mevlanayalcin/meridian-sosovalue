@@ -1,8 +1,8 @@
 import { SoDexClient } from "../providers/sodex";
-import { SoSoValueClient } from "../providers/sosovalue";
+import { parseFomcNextProbabilities, SoSoValueClient } from "../providers/sosovalue";
 import { computeSsiParity } from "../providers/onchain";
 import { detectMarketRegime, runBasketBacktest } from "../engine/quant";
-import { evaluateTradeFirewall } from "../engine/firewall";
+import { runFirewallWithLiveData } from "../engine/live-firewall";
 import type { BasketLeg } from "../shared/types";
 
 interface JsonRpcRequest {
@@ -146,7 +146,15 @@ export async function handleMcpRequest(reqBody: JsonRpcRequest, opts?: { sosoApi
           soso.getIndices().catch(() => []),
           soso.getFomcProbabilities().catch(() => null)
         ]);
-        payload = { connected: true, symbol: sym, overview, etfHistory, indices, fomc };
+        payload = {
+          connected: true,
+          symbol: sym,
+          overview,
+          etfHistory,
+          indices,
+          fomcParsed: parseFomcNextProbabilities(fomc),
+          fomc
+        };
       }
     } else if (name === "meridian_ssi_parity") {
       const spot = await sodex.getSpotTickers();
@@ -159,38 +167,16 @@ export async function handleMcpRequest(reqBody: JsonRpcRequest, opts?: { sosoApi
       const symbol = String(args.symbol ?? "vMAG7ssi_vUSDC");
       const side = (String(args.side ?? "BUY").toUpperCase() === "SELL" ? "SELL" : "BUY") as "BUY" | "SELL";
       const notionalUsd = Number(args.notionalUsd ?? 1000);
-      const book = marketType === "wealth" ? null : await sodex.getOrderbook(marketType, symbol, 50).catch(() => null);
-      let refPx = book?.midPrice ?? 0;
-      let volPct = 3.5;
-      let channel = "clob";
-      let assetFound = true;
-      if (marketType === "wealth") {
-        const funds = await sodex.getWealthFunds();
-        const f = funds.find((x) => x.fundId === symbol);
-        assetFound = Boolean(f);
-        refPx = f?.price ?? 0;
-        channel = f?.channel ?? "not_found";
-      } else {
-        const ticks = marketType === "spot" ? await sodex.getSpotTickers() : await sodex.getPerpsTickers();
-        const t = ticks.find((x) => x.symbol === symbol);
-        assetFound = Boolean(t || book);
-        if (t && t.lastPx > 0) {
-          refPx = t.lastPx;
-          volPct = ((t.highPx - t.lowPx) / t.lastPx) * 100;
-        }
-      }
-      payload = await evaluateTradeFirewall(
-        {
-          marketType,
-          symbol,
-          side,
-          notionalUsd,
-          portfolioTotalUsd: args.portfolioTotalUsd !== undefined ? Number(args.portfolioTotalUsd) : undefined,
-          existingAssetUsd: args.existingAssetUsd !== undefined ? Number(args.existingAssetUsd) : undefined,
-          maxSlippageBps: Number(args.maxSlippageBps ?? 60)
-        },
-        { orderbook: book, intradayVolPct: volPct, venueChannelStatus: channel, referencePrice: refPx, assetFound }
-      );
+      // Reuse the exact shared live firewall path (checks live HALT symbol status, L2 depth, volatility & caps)
+      payload = await runFirewallWithLiveData({
+        marketType,
+        symbol,
+        side,
+        notionalUsd,
+        portfolioTotalUsd: args.portfolioTotalUsd !== undefined ? Number(args.portfolioTotalUsd) : undefined,
+        existingAssetUsd: args.existingAssetUsd !== undefined ? Number(args.existingAssetUsd) : undefined,
+        maxSlippageBps: Number(args.maxSlippageBps ?? 60)
+      });
     } else if (name === "meridian_backtest_basket") {
       const legs: BasketLeg[] = Array.isArray(args.legs)
         ? (args.legs as BasketLeg[])

@@ -13,7 +13,8 @@ import { evaluateTradeFirewall, simulateBookFill } from "../src/engine/firewall"
 import { detectMarketRegime, runBasketBacktest } from "../src/engine/quant";
 import { hasHallucinatedPercentage, sanitizeVaultApy } from "../src/engine/ai-analyst";
 import { scaleTokenSupply } from "../src/providers/onchain";
-import { SoSoValueClient } from "../src/providers/sosovalue";
+import { parseFomcNextProbabilities, SoSoValueClient } from "../src/providers/sosovalue";
+import { classifyHeadlineSentiment } from "../src/providers/news-fallback";
 import { handleMcpRequest } from "../src/worker/mcp";
 import { app } from "../src/worker/index";
 import type { OrderbookSnapshot } from "../src/shared/types";
@@ -225,14 +226,40 @@ describe("On-Chain 8-Decimal SSI Supply, APY Sanitizer & SoSoValue Client", () =
     expect(scaleTokenSupply(raw8Dec, 8)).toBe(167_000_000);
   });
 
-  it("filters pathological APY outliers & equity 7d swings and catches >=1000% LLM hallucinations", () => {
+  it("filters pathological APY outliers & equity 7d swings and catches >=1000% hallucinations without false-positiving funding rates", () => {
     expect(sanitizeVaultApy(215214.5)).toBeNull();
     expect(sanitizeVaultApy(-64.58)).toBeNull();
     expect(sanitizeVaultApy(8.423)).toBe(8.42);
     expect(hasHallucinatedPercentage("UNITREE offers 215,214% APY right now.")).toBe(true);
     expect(hasHallucinatedPercentage("Annualized return of 61,338.43% APY")).toBe(true);
     expect(hasHallucinatedPercentage("Extreme 215214% yield")).toBe(true);
+    expect(hasHallucinatedPercentage("Spaced 61338 % outlier")).toBe(true);
+    expect(hasHallucinatedPercentage("Written out 61338 percent yield")).toBe(true);
     expect(hasHallucinatedPercentage("Morpho-Earn carries 8.42% APY")).toBe(false);
+    expect(hasHallucinatedPercentage("BTC-USD Perp funding rate is 0.0013% (-0.0009% 8h)")).toBe(false);
+  });
+
+  it("parses live SoSoValue FOMC rate_ranges + string arrays cleanly and ignores null cells", () => {
+    const parsed = parseFomcNextProbabilities({
+      rate_ranges: ["375-400", "400-425", "425-450"],
+      meetings: [
+        {
+          meeting_date: "2026-12-09",
+          probabilities: ["1.1", "98.9", null]
+        }
+      ]
+    });
+    expect(parsed.meetingDate).toBe("2026-12-09");
+    expect(parsed.probabilities).toEqual([
+      { rateRange: "375-400", probabilityPct: 1.1 },
+      { rateRange: "400-425", probabilityPct: 98.9 }
+    ]);
+  });
+
+  it("classifies exchange breach and security incident headlines as BEARISH", () => {
+    expect(classifyHeadlineSentiment("Bithumb data breach exposes customer records")).toBe("BEARISH");
+    expect(classifyHeadlineSentiment("Record exchange hack drains $40M in hot wallet funds")).toBe("BEARISH");
+    expect(classifyHeadlineSentiment("Spot Bitcoin ETF sees $450M institutional inflow")).toBe("BULLISH");
   });
 
   it("sends x-soso-api-key header and unwraps SoSoValue OpenAPI v1 envelopes", async () => {
@@ -301,10 +328,14 @@ describe("Quantitative Regime (SoSoValue Overlay) & Periodic Backtest Engine", (
   });
 });
 
-describe("Worker API & MCP JSON-RPC Endpoints", () => {
-  it("responds healthy on /health and serves OpenAPI 3.0.3 schema", async () => {
+describe("Worker API, Batch Anti-Splitting, Security Headers & MCP JSON-RPC Endpoints", () => {
+  it("responds healthy on /health with strict security headers and serves OpenAPI 3.0.3 schema", async () => {
     const res = await app.request("/health");
     expect(res.status).toBe(200);
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("strict-transport-security")).toContain("max-age=");
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'self'");
     const body = (await res.json()) as { ok: boolean };
     expect(body.ok).toBe(true);
 
@@ -316,7 +347,7 @@ describe("Worker API & MCP JSON-RPC Endpoints", () => {
     expect(spec.paths["/api/v1/execution/submit"]).toBeDefined();
   });
 
-  it("handles MCP initialize, notifications/initialized (202), and 6 tools including meridian_sosovalue_macro", async () => {
+  it("handles MCP initialize, notifications/initialized (202), batch arrays (200), and 6 tools", async () => {
     const init = (await handleMcpRequest({ jsonrpc: "2.0", id: 1, method: "initialize" })) as {
       result?: { serverInfo?: { name: string } };
     };
@@ -329,10 +360,179 @@ describe("Worker API & MCP JSON-RPC Endpoints", () => {
     });
     expect(notifRes.status).toBe(202);
 
+    const batchRes = await app.request("/mcp", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 10, method: "ping" },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        { jsonrpc: "2.0", id: 11, method: "tools/list" }
+      ])
+    });
+    expect(batchRes.status).toBe(200);
+    const batchJson = (await batchRes.json()) as Array<{ id: number }>;
+    expect(batchJson).toHaveLength(2);
+    expect(batchJson.map((x) => x.id)).toEqual([10, 11]);
+
     const tools = (await handleMcpRequest({ jsonrpc: "2.0", id: 2, method: "tools/list" })) as {
       result?: { tools?: Array<{ name: string }> };
     };
     expect(tools.result?.tools?.length).toBeGreaterThanOrEqual(6);
     expect(tools.result?.tools?.some((t) => t.name === "meridian_sosovalue_macro")).toBe(true);
+  });
+
+  it("blocks HALT symbols consistently via MCP meridian_check_trade_firewall", async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes("/spot/markets/symbols")) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: [{ id: 99, name: "vSPCX_vUSDC", status: "HALT", tickSize: "0.01", stepSize: "0.01" }]
+          })
+        };
+      }
+      if (url.includes("/spot/markets/tickers")) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: [
+              {
+                symbol: "vSPCX_vUSDC",
+                lastPx: "120",
+                openPx: "120",
+                highPx: "121",
+                lowPx: "119",
+                volume: "10",
+                quoteVolume: "1200",
+                changePct: 0,
+                bidPx: "119.9",
+                askPx: "120.1"
+              }
+            ]
+          })
+        };
+      }
+      if (url.includes("/orderbook")) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: {
+              bids: [["119.9", "100"]],
+              asks: [["120.1", "100"]],
+              blockHeight: 1,
+              blockTime: 1
+            }
+          })
+        };
+      }
+      return { ok: true, json: async () => ({ code: 0, data: [] }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const res = (await handleMcpRequest({
+        jsonrpc: "2.0",
+        id: 55,
+        method: "tools/call",
+        params: {
+          name: "meridian_check_trade_firewall",
+          arguments: { marketType: "spot", symbol: "vSPCX_vUSDC", side: "BUY", notionalUsd: 500 }
+        }
+      })) as { result?: { content?: Array<{ text: string }> } };
+      const parsed = JSON.parse(res.result?.content?.[0]?.text ?? "{}") as { verdict: string; venueChannelStatus: string };
+      expect(parsed.verdict).toBe("BLOCK");
+      expect(parsed.venueChannelStatus).toBe("HALT");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("defeats batch order-splitting on /api/v1/execution/submit (20 x 0.25 vBTC exceeding book depth -> 403)", async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes("/spot/markets/symbols")) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: [{ id: 1, name: "vBTC_vUSDC", status: "NORMAL", tickSize: "0.1", stepSize: "0.0001" }]
+          })
+        };
+      }
+      if (url.includes("/spot/markets/tickers")) {
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: [
+              {
+                symbol: "vBTC_vUSDC",
+                lastPx: "60000",
+                openPx: "59900",
+                highPx: "60500",
+                lowPx: "59500",
+                volume: "100",
+                quoteVolume: "6000000",
+                changePct: 0.16,
+                bidPx: "59995",
+                askPx: "60005"
+              }
+            ]
+          })
+        };
+      }
+      if (url.includes("/orderbook")) {
+        // Total bid depth = $180,000 -> single 0.25 BTC ($15k) passes easily, 20 x 0.25 BTC ($300k) exhausts book!
+        return {
+          ok: true,
+          json: async () => ({
+            code: 0,
+            data: {
+              bids: [
+                ["59995", "1.5"],
+                ["59980", "1.5"]
+              ],
+              asks: [
+                ["60005", "1.5"],
+                ["60020", "1.5"]
+              ],
+              blockHeight: 1,
+              blockTime: 1
+            }
+          })
+        };
+      }
+      return { ok: true, json: async () => ({ code: 0, data: {} }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const splitOrders = Array.from({ length: 20 }, (_, i) => ({
+        symbolID: 1,
+        clOrdID: `split-${i}`,
+        side: 2,
+        type: 2,
+        timeInForce: 3,
+        quantity: "0.25"
+      }));
+      const res = await app.request("/api/v1/execution/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          network: "mainnet",
+          marketType: "spot",
+          httpBody: { accountID: 1001, orders: splitOrders },
+          wireSignature: "0x01" + "ab".repeat(65),
+          nonce: Date.now()
+        })
+      });
+      expect(res.status).toBe(403);
+      const body = (await res.json()) as { ok: boolean; blocked: boolean; error: string };
+      expect(body.ok).toBe(false);
+      expect(body.blocked).toBe(true);
+      expect(body.error).toContain("Batch submission rejected");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

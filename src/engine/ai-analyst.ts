@@ -17,9 +17,17 @@ export function sanitizeVaultApy(apy: number | null): number | null {
 }
 
 export function hasHallucinatedPercentage(text: string): boolean {
-  // Flags >=1,000% (with or without commas or decimals), e.g. "215,214%", "61338.43%"
-  const matches = text.match(/(?:^|[^\d])(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?%/g);
-  return Boolean(matches && matches.length > 0);
+  // Flags >=1,000% (with or without commas, spaces, decimals, or "percent"), while NEVER flagging
+  // tiny decimal percentages such as funding rates ("0.0013%", "-0.0009%").
+  const regex = /(?:^|[^\d.])(\d{1,3}(?:,\d{3})+|\d{4,})(?:\.\d+)?\s*(?:%|percent\b)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const numeric = Number.parseFloat(match[1].replace(/,/g, ""));
+    if (Number.isFinite(numeric) && numeric >= 1000) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

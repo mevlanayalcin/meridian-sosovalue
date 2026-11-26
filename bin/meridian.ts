@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 import { buildMarketOverview } from "../src/worker/overview";
 import { SoDexClient } from "../src/providers/sodex";
-import { evaluateTradeFirewall } from "../src/engine/firewall";
+import { runFirewallWithLiveData } from "../src/engine/live-firewall";
 import { runBasketBacktest } from "../src/engine/quant";
 
 async function main() {
@@ -37,13 +37,8 @@ async function main() {
     const symbol = arg1 || "vMAG7ssi_vUSDC";
     const side = (arg2?.toUpperCase() === "SELL" ? "SELL" : "BUY") as "BUY" | "SELL";
     const notionalUsd = Number.parseFloat(arg3 || "2500");
-    const marketType = symbol.includes("-") ? "perps" : "spot";
-    const sodex = new SoDexClient();
-    const book = await sodex.getOrderbook(marketType, symbol, 50);
-    const result = await evaluateTradeFirewall(
-      { marketType, symbol, side, notionalUsd },
-      { orderbook: book, intradayVolPct: 4.1, venueChannelStatus: "clob", referencePrice: book.midPrice }
-    );
+    const marketType = symbol.includes("-") ? "perps" : symbol.includes("_") ? "spot" : "wealth";
+    const result = await runFirewallWithLiveData({ marketType, symbol, side, notionalUsd });
     console.log(JSON.stringify(result, null, 2));
     return;
   }

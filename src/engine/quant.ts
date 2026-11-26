@@ -72,6 +72,9 @@ export function detectMarketRegime(
     sosoConfidenceBonus += 3;
     rationale.push(`Curated news sentiment index ${newsScore >= 0 ? "+" : ""}${newsScore.toFixed(2)} integrated into regime bias.`);
   }
+  if (sosoOverlay?.fomcHoldOrCutBias) {
+    rationale.push(`SoSoValue FOMC dominant implied band: ${sosoOverlay.fomcHoldOrCutBias}.`);
+  }
 
   const adjustedCryptoMomentum = avgCryptoChange24hPct + sosoMomentumAdj;
   let label: MarketRegime = "ROTATION";

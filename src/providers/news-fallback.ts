@@ -13,9 +13,12 @@ export interface PublicNewsItem {
 }
 
 const BULL_WORDS = /\b(surge|rally|inflow|approve|adoption|record|launch|partner|growth|breakout|gain|soar|etf)\b/i;
-const BEAR_WORDS = /\b(hack|exploit|outflow|drop|crash|lawsuit|ban|decline|liquidation|sec|warning|selloff|slump)\b/i;
+const SEVERE_BEAR_WORDS = /\b(breach|hack|hacked|exploit|exploited|stolen|drained|phishing|bankrupt|bankruptcy|insolvency|rugpull|fraud|outage)\b/i;
+const BEAR_WORDS = /\b(breach|hack|hacked|exploit|exploited|stolen|drained|phishing|bankrupt|bankruptcy|insolvency|outage|halted|fraud|outflow|drop|crash|lawsuit|ban|decline|liquidation|sec|warning|selloff|slump|fine|penalty|investigation)\b/i;
 
 export function classifyHeadlineSentiment(title: string): "BULLISH" | "BEARISH" | "NEUTRAL" {
+  // Severe security/insolvency events override generic bullish words (e.g. "record breach")
+  if (SEVERE_BEAR_WORDS.test(title)) return "BEARISH";
   const bull = BULL_WORDS.test(title);
   const bear = BEAR_WORDS.test(title);
   if (bull && !bear) return "BULLISH";
